@@ -1,0 +1,168 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "DALI USB (Helvar 510)",
+        "description": "Yhdistä 510 USB-DALI-liitäntä. Väylä skannataan pelkillä kyselyillä (osoitteita, scenejä tai ryhmiä ei kirjoiteta).",
+        "data": {
+          "path": "USB-laite",
+          "poll_interval": "Kyselyväli (sekuntia)",
+          "hide_strip_channels": "Piilota RGB/RGBW-nauhojen yksittäiset kanavat (pysyvät käytössä)",
+          "hide_group_members": "Piilota DALI-ryhmien jäsenvalot (pysyvät käytössä)"
+        }
+      },
+      "strips": {
+        "title": "Kokoa RGB/RGBW-nauhat",
+        "description": "Löytyi {count} DALI-laitetta ja {suggestions} ehdotettua monikanavanauhaa. Kokoa nauha 3 (RGB) tai 4 (RGBW) lyhytosoitteesta tai ohita. Ehdotetut osoitteet: {suggestion}.",
+        "data": {
+          "name": "Nimi",
+          "mode": "Tila",
+          "r": "Punainen kanava",
+          "g": "Vihreä kanava",
+          "b": "Sininen kanava",
+          "w": "Valkoinen kanava (vain RGBW)",
+          "add_another": "Lisää tämän jälkeen toinen nauha",
+          "skip": "Ohita / nauhat valmiit"
+        }
+      },
+      "confirm": {
+        "title": "Vahvista",
+        "description": "{count} laitetta ({types}), {strips} nauhaa. Skannaus käytti vain kyselyitä; väylällä ei muutettu mitään."
+      }
+    },
+    "error": {
+      "cannot_connect": "510:ää ei saatu auki tai väylä ei vastaa",
+      "no_gears": "Yksikään laite ei vastannut (onko DALI-väylällä virtalähde?)",
+      "invalid_strip": "Virheellinen nauhavalinta",
+      "strip_overlap": "Osoitteet ovat jo toisessa nauhassa"
+    },
+    "abort": {
+      "already_configured": "Tämä 510 on jo määritetty",
+      "cannot_connect": "510:ää ei saatu auki"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "DALI USB (Helvar 510) -asetukset",
+        "description": "Nykyiset nauhat: {strips}",
+        "data": {
+          "poll_interval": "Kyselyväli (sekuntia)",
+          "hide_strip_channels": "Piilota nauhojen kanavaentiteetit (pysyvät käytössä)",
+          "hide_group_members": "Piilota DALI-ryhmien jäsenvalot (pysyvät käytössä)",
+          "action": "Toiminto"
+        }
+      },
+      "add_strip": {
+        "title": "Lisää RGB/RGBW-nauha",
+        "data": {
+          "name": "Nimi",
+          "mode": "Tila",
+          "r": "Punainen kanava",
+          "g": "Vihreä kanava",
+          "b": "Sininen kanava",
+          "w": "Valkoinen kanava (vain RGBW)",
+          "add_another": "Lisää vielä yksi",
+          "skip": "Peruuta"
+        }
+      },
+      "select_strip": {
+        "title": "Valitse nauha",
+        "data": {
+          "strip": "Nauha"
+        }
+      },
+      "edit_strip": {
+        "title": "Muokkaa nauhaa",
+        "description": "Nykyinen: {strip}. Nauhan entiteetti, nimi, aliakset, alue ja laite säilyvät; vain kanavat, nimi ja tila muuttuvat.",
+        "data": {
+          "name": "Nimi",
+          "mode": "Tila",
+          "r": "Punainen kanava",
+          "g": "Vihreä kanava",
+          "b": "Sininen kanava",
+          "w": "Valkoinen kanava (vain RGBW)",
+          "skip": "Peruuta"
+        }
+      }
+    },
+    "error": {
+      "invalid_strip": "Virheellinen nauhavalinta",
+      "strip_overlap": "Osoite on jo toisessa nauhassa"
+    }
+  },
+  "selector": {
+    "strip_mode": {
+      "options": {
+        "rgb": "RGB (3 kanavaa)",
+        "rgbw": "RGBW (4 kanavaa)"
+      }
+    },
+    "options_action": {
+      "options": {
+        "save": "Tallenna",
+        "add_strip": "Lisää RGB/RGBW-nauha",
+        "edit_strip": "Muokkaa nauhaa",
+        "delete_strip": "Poista nauha",
+        "clear_strips": "Poista kaikki nauhat",
+        "rescan": "Skannaa väylä uudelleen (vain kyselyt)"
+      }
+    }
+  },
+  "services": {
+    "send_raw": {
+      "name": "Lähetä raaka DALI-kehys",
+      "description": "Edistynyt (vain ylläpitäjä): lähettää yhden 16-bittisen DALI-kehyksen. Konfiguraatio- ja käyttöönottokäskyt estetään.",
+      "fields": {
+        "addr": {
+          "name": "Osoitetavu",
+          "description": "DALI-osoitetavu (0–255)"
+        },
+        "data": {
+          "name": "Datatavu",
+          "description": "DALI-käsky / tasoarvo (0–255)"
+        },
+        "expect_reply": {
+          "name": "Odota vastausta",
+          "description": "Odota vastauskehystä (kyselyt)"
+        }
+      }
+    },
+    "add_to_group": {
+      "name": "Lisää laite DALI-ryhmään",
+      "description": "Vain ylläpitäjä: lähettää DALI ADD TO GROUP -käskyn (0x60+ryhmä) kahdesti YHDELLE lyhytosoitteelle ja tarkistaa tuloksen QUERY GROUPS -kyselyllä.",
+      "fields": {
+        "short_address": {
+          "name": "Lyhytosoite",
+          "description": "DALI-lyhytosoite 0–63"
+        },
+        "group": {
+          "name": "Ryhmä",
+          "description": "DALI-ryhmä 0–15 (työkalut, jotka numeroivat ryhmät 1–16, kutsuvat ryhmää 4 nimellä \"Group 5\")"
+        },
+        "method": {
+          "name": "Kahdesti lähetys",
+          "description": "auto = 510:n send-twice-bitti, varalla kaksi kehystä"
+        }
+      }
+    },
+    "remove_from_group": {
+      "name": "Poista laite DALI-ryhmästä",
+      "description": "Vain ylläpitäjä: lähettää DALI REMOVE FROM GROUP -käskyn (0x70+ryhmä) kahdesti YHDELLE lyhytosoitteelle ja tarkistaa tuloksen.",
+      "fields": {
+        "short_address": {
+          "name": "Lyhytosoite",
+          "description": "DALI-lyhytosoite 0–63"
+        },
+        "group": {
+          "name": "Ryhmä",
+          "description": "DALI-ryhmä 0–15 (työkalut, jotka numeroivat ryhmät 1–16, kutsuvat ryhmää 4 nimellä \"Group 5\")"
+        },
+        "method": {
+          "name": "Kahdesti lähetys",
+          "description": "auto = 510:n send-twice-bitti, varalla kaksi kehystä"
+        }
+      }
+    }
+  }
+}

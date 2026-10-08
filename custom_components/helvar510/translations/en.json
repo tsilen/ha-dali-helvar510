@@ -1,0 +1,168 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "DALI USB (Helvar 510)",
+        "description": "Connect the 510 USB-DALI interface. The bus is scanned with queries only (no addressing, no scene or group writes).",
+        "data": {
+          "path": "USB device",
+          "poll_interval": "Poll interval (seconds)",
+          "hide_strip_channels": "Hide individual channels of RGB/RGBW strips (they stay enabled)",
+          "hide_group_members": "Hide lights that are members of a DALI group (they stay enabled)"
+        }
+      },
+      "strips": {
+        "title": "Assemble RGB/RGBW strips",
+        "description": "Found {count} DALI control gear and {suggestions} suggested multi-channel strip(s). Assemble a strip from 3 (RGB) or 4 (RGBW) short addresses, or skip. Suggested addresses: {suggestion}.",
+        "data": {
+          "name": "Name",
+          "mode": "Mode",
+          "r": "Red channel",
+          "g": "Green channel",
+          "b": "Blue channel",
+          "w": "White channel (RGBW only)",
+          "add_another": "Add another strip after this one",
+          "skip": "Skip / done with strips"
+        }
+      },
+      "confirm": {
+        "title": "Confirm",
+        "description": "{count} control gear ({types}), {strips} strip(s). The scan used queries only; nothing on the bus was changed."
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not open the 510 or talk on the bus",
+      "no_gears": "No control gear answered (is the DALI bus powered?)",
+      "invalid_strip": "Invalid strip selection",
+      "strip_overlap": "Those addresses are already used in another strip"
+    },
+    "abort": {
+      "already_configured": "This 510 is already configured",
+      "cannot_connect": "Could not open the 510"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "DALI USB (Helvar 510) options",
+        "description": "Current strips: {strips}",
+        "data": {
+          "poll_interval": "Poll interval (seconds)",
+          "hide_strip_channels": "Hide strip channel entities (they stay enabled)",
+          "hide_group_members": "Hide lights that are members of a DALI group (they stay enabled)",
+          "action": "Action"
+        }
+      },
+      "add_strip": {
+        "title": "Add RGB/RGBW strip",
+        "data": {
+          "name": "Name",
+          "mode": "Mode",
+          "r": "Red channel",
+          "g": "Green channel",
+          "b": "Blue channel",
+          "w": "White channel (RGBW only)",
+          "add_another": "Add another",
+          "skip": "Cancel"
+        }
+      },
+      "select_strip": {
+        "title": "Select strip",
+        "data": {
+          "strip": "Strip"
+        }
+      },
+      "edit_strip": {
+        "title": "Edit strip",
+        "description": "Current: {strip}. The strip entity, its name, aliases, area and device are kept; only channels, name and mode change.",
+        "data": {
+          "name": "Name",
+          "mode": "Mode",
+          "r": "Red channel",
+          "g": "Green channel",
+          "b": "Blue channel",
+          "w": "White channel (RGBW only)",
+          "skip": "Cancel"
+        }
+      }
+    },
+    "error": {
+      "invalid_strip": "Invalid strip selection",
+      "strip_overlap": "Address already used in another strip"
+    }
+  },
+  "selector": {
+    "strip_mode": {
+      "options": {
+        "rgb": "RGB (3 channels)",
+        "rgbw": "RGBW (4 channels)"
+      }
+    },
+    "options_action": {
+      "options": {
+        "save": "Save",
+        "add_strip": "Add RGB/RGBW strip",
+        "edit_strip": "Edit strip",
+        "delete_strip": "Delete strip",
+        "clear_strips": "Delete all strips",
+        "rescan": "Rescan bus (queries only)"
+      }
+    }
+  },
+  "services": {
+    "send_raw": {
+      "name": "Send raw DALI frame",
+      "description": "Advanced (admin only): sends one 16-bit DALI forward frame. Configuration and commissioning commands are refused.",
+      "fields": {
+        "addr": {
+          "name": "Address byte",
+          "description": "DALI address byte (0-255)"
+        },
+        "data": {
+          "name": "Data byte",
+          "description": "DALI command / arc level (0-255)"
+        },
+        "expect_reply": {
+          "name": "Expect reply",
+          "description": "Wait for a backward frame (queries)"
+        }
+      }
+    },
+    "add_to_group": {
+      "name": "Add gear to DALI group",
+      "description": "Admin only: sends DALI ADD TO GROUP (0x60+group) twice to ONE short address and verifies with QUERY GROUPS.",
+      "fields": {
+        "short_address": {
+          "name": "Short address",
+          "description": "DALI short address 0-63"
+        },
+        "group": {
+          "name": "Group",
+          "description": "DALI group 0-15 (tools that number groups 1-16 call group 4 \"Group 5\")"
+        },
+        "method": {
+          "name": "Send-twice method",
+          "description": "auto = the 510's send-twice bit, falls back to two frames if not verified"
+        }
+      }
+    },
+    "remove_from_group": {
+      "name": "Remove gear from DALI group",
+      "description": "Admin only: sends DALI REMOVE FROM GROUP (0x70+group) twice to ONE short address and verifies with QUERY GROUPS.",
+      "fields": {
+        "short_address": {
+          "name": "Short address",
+          "description": "DALI short address 0-63"
+        },
+        "group": {
+          "name": "Group",
+          "description": "DALI group 0-15 (tools that number groups 1-16 call group 4 \"Group 5\")"
+        },
+        "method": {
+          "name": "Send-twice method",
+          "description": "auto = the 510's send-twice bit, falls back to two frames if not verified"
+        }
+      }
+    }
+  }
+}
