@@ -1,0 +1,102 @@
+send_raw:
+  name: Send raw DALI frame
+  description: >
+    Advanced, admin only. Sends one 16-bit DALI forward frame through the 510.
+    Configuration and commissioning frames (INITIALISE, RANDOMISE, PROGRAM
+    SHORT ADDRESS, STORE/SET ..., RESET, DTR writes, ADD/REMOVE GROUP,
+    application extended commands ...) are refused by the driver.
+  fields:
+    addr:
+      name: Address byte
+      description: DALI address byte (e.g. 0x01 = short 0 command, 0x00 = short 0 DAPC, 0xFF = broadcast command)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    data:
+      name: Data byte
+      description: DALI data / command / arc level
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    expect_reply:
+      name: Expect reply
+      description: Wait for a backward frame (queries)
+      default: false
+      selector:
+        boolean:
+
+add_to_group:
+  name: Add gear to DALI group
+  description: >
+    Admin only. Sends DALI ADD TO GROUP (0x60+group) twice to ONE short address and
+    verifies with QUERY GROUPS. Only this command (and remove_from_group) may
+    write gear configuration; broadcast/group addressing is refused.
+  fields:
+    short_address:
+      name: Short address
+      description: DALI short address 0-63 (Home Assistant "DALI 5" = 5)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 63
+          mode: box
+    group:
+      name: Group
+      description: DALI group 0-15 (tools numbering groups 1-16 call group 4 "Group 5")
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 15
+          mode: box
+    method:
+      name: Send-twice method
+      description: auto = 510 send-twice bit, falls back to two frames if not verified
+      default: auto
+      selector:
+        select:
+          options:
+            - auto
+            - twice_bit
+            - two_frames
+remove_from_group:
+  name: Remove gear from DALI group
+  description: >
+    Admin only. Sends DALI REMOVE FROM GROUP (0x70+group) twice to ONE short address and
+    verifies with QUERY GROUPS.
+  fields:
+    short_address:
+      name: Short address
+      description: DALI short address 0-63
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 63
+          mode: box
+    group:
+      name: Group
+      description: DALI group 0-15
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 15
+          mode: box
+    method:
+      name: Send-twice method
+      description: auto = 510 send-twice bit, falls back to two frames if not verified
+      default: auto
+      selector:
+        select:
+          options:
+            - auto
+            - twice_bit
+            - two_frames
