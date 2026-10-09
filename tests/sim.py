@@ -10,6 +10,7 @@ from __future__ import annotations
 import select
 import socket
 import threading
+import time
 
 # Synthetic installation:
 #   0-3  DT6, consecutive random addresses -> one RGBW multi-channel driver
@@ -52,6 +53,12 @@ class SimBus:
         self.log: list[bytes] = []            # every live OUT payload
         self.violations: list[str] = []       # frames a correct driver never sends
         self.levels = {sa: 0 for sa in self.gear}
+        # Optional fade simulation: seconds a level change takes per short
+        # address (0 = jump). While fading, QUERY ACTUAL LEVEL answers the
+        # intermediate level and QUERY STATUS has bit 4 (fade running) set,
+        # like real IEC 62386-102 gear.
+        self.fade_s: dict[int, float] = {}
+        self._fades: dict[int, tuple[int, int, float, float]] = {}
         self.groups = {sa: sum(1 << g for g in v["groups"]) for sa, v in self.gear.items()}
         self.twice_bit_works = True
         self.silent = False                   # stop answering (timeout tests)
@@ -112,13 +119,13 @@ class SimBus:
             targets = self._targets(addr)
             if not is_cmd:
                 for sa in targets:
-                    self.levels[sa] = 0 if data == 0 else data
+                    self._set_level(sa, 0 if data == 0 else data, fade=True)
             elif data == 0x00:
                 for sa in targets:
-                    self.levels[sa] = 0
+                    self._set_level(sa, 0, fade=False)  # OFF is immediate
             elif data == 0x05:
                 for sa in targets:
-                    self.levels[sa] = 254
+                    self._set_level(sa, 254, fade=False)  # RECALL MAX too
             return STATUS_OK
         sa = addr >> 1
         if addr >= 0x80 or sa not in self.gear:
@@ -126,13 +133,15 @@ class SimBus:
         g = self.gear[sa]
         if dt_enabled == 8 and g["dt"] == 8 and data in (0xF7, 0xF8, 0xF9):
             return reply({0xF9: 0x02, 0xF8: 0x00, 0xF7: 0x00}[data])
+        level = self.actual(sa)
+        fading = sa in self._fades
         table = {
-            0x90: 0x04,               # QUERY STATUS
+            0x90: (0x04 if level else 0) | (0x10 if fading else 0),  # QUERY STATUS
             0x91: 0xFF,               # QUERY CONTROL GEAR PRESENT
             0x97: 0x08,               # QUERY VERSION NUMBER
             0x99: g["dt"],            # QUERY DEVICE TYPE
             0x9A: 1,                  # QUERY PHYSICAL MINIMUM
-            0xA0: self.levels[sa],    # QUERY ACTUAL LEVEL
+            0xA0: level,              # QUERY ACTUAL LEVEL
             0xA1: 254,                # QUERY MAX LEVEL
             0xA2: 1,                  # QUERY MIN LEVEL
             0xC0: self.groups[sa] & 0xFF,
@@ -144,6 +153,27 @@ class SimBus:
         if data in table:
             return reply(table[data])
         return NO_REPLY
+
+    def _set_level(self, sa: int, target: int, *, fade: bool) -> None:
+        start = self.actual(sa)
+        fade_s = self.fade_s.get(sa, 0.0) if fade else 0.0
+        self.levels[sa] = target
+        if fade_s > 0 and start != target:
+            self._fades[sa] = (start, target, time.monotonic(), fade_s)
+        else:
+            self._fades.pop(sa, None)
+
+    def actual(self, sa: int) -> int:
+        """Actual arc level right now (intermediate while fading)."""
+        fade = self._fades.get(sa)
+        if fade is None:
+            return self.levels[sa]
+        start, target, t0, dur = fade
+        frac = (time.monotonic() - t0) / dur
+        if frac >= 1:
+            self._fades.pop(sa, None)
+            return target
+        return int(round(start + (target - start) * frac))
 
     # ------------------------------------------------------------ transport
     def _serve(self) -> None:

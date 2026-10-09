@@ -40,7 +40,10 @@ lighting through a **Helvar DIGIDIM 510 USB-DALI interface** (USB ID
   Layout changes are applied immediately without a rescan or reload.
 - **`send_raw`** service for advanced use, with a safety filter.
 - **Polling** of QUERY ACTUAL LEVEL (default every 30 s) plus a quick
-  re-check after each command.
+  re-check after each command. The state follows the commanded level
+  immediately; a readback taken while the gear is still fading (DALI fade
+  time) does not pull it back, so `brightness_step` / dimmer remotes step
+  smoothly.
 - **Diagnostics** download with the scan result and the last bus frames
   (USB serial number redacted).
 
@@ -240,6 +243,31 @@ uv pip compile requirements_test.in --universal --python-version 3.14.2 \
 
 The tests run the real driver against a simulated 510 and DALI bus with
 synthetic gear (`tests/sim.py`).
+
+## Changelog
+
+### 0.3.1
+
+- Fix `light.turn_on` with `brightness_step` / `brightness_step_pct` (e.g. a
+  Hue dimmer automation): dimming up barely raised the brightness and the
+  value jumped back and forth.
+  - Strips whose colour was not at full value (e.g. RGBW `(0, 0, 0, 128)`)
+    applied it twice, so the reported brightness was lower than the one set
+    and every step up ended darker. Colours are now kept normalised and the
+    reported brightness is what is lit (output unchanged).
+  - A poll or readback that started before a command wrote its old snapshot
+    back over the new state; readbacks now only update the addresses they
+    read and drop values superseded by a newer command.
+  - A readback while the gear is fading no longer replaces the commanded
+    level with the intermediate one (QUERY STATUS "fade running" is checked;
+    queries only).
+  - The brightness that was set is reported exactly (HA 0–255 and DALI arc
+    levels do not map 1:1).
+  - Readbacks after rapid repeated commands are coalesced.
+
+### 0.3.0
+
+- Initial public release.
 
 ## License
 
