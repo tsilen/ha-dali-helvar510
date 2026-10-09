@@ -65,6 +65,11 @@ class SimBus:
         # the 510 does not answer at all (driver times out).
         self.drop: dict[int, int] = {}
         self.swallow_frames = 0
+        # Bus timing: seconds until the 510 answers a forward frame without /
+        # with a backward frame (DALI 1200 baud ~ 25 ms / ~ 40 ms + USB)
+        self.frame_delay_s = 0.0
+        self.ignore_group_frames = False      # gear do not act on group frames
+        self.query_delay_s = 0.0
         self.arc_frames = 0                   # DAPC / arc commands seen
         self.queries = 0                      # frames expecting a reply
         self.groups = {sa: sum(1 << g for g in v["groups"]) for sa, v in self.gear.items()}
@@ -126,6 +131,8 @@ class SimBus:
         if not ctl & 0x04:  # no reply expected: DAPC / arc command
             self.arc_frames += 1
             targets = [sa for sa in self._targets(addr) if not self._dropped(sa)]
+            if self.ignore_group_frames and 0x80 <= addr < 0xA0:
+                targets = []
             if not is_cmd:
                 for sa in targets:
                     self._set_level(sa, 0 if data == 0 else data, fade=True)
@@ -223,6 +230,10 @@ class SimBus:
                     self.swallow_frames -= 1
                     continue
                 ans = self.answer(live)
+                if live[:1] == b"\x03":
+                    delay = self.query_delay_s if live[1] & 0x04 else self.frame_delay_s
+                    if delay:
+                        time.sleep(delay)
                 try:
                     self.b.sendall(ans + bytes(36 - len(ans)))
                 except OSError:

@@ -252,6 +252,25 @@ synthetic gear (`tests/sim.py`).
 
 ## Changelog
 
+### 0.3.3
+
+- **DALI All / groups are one light.** Setting their brightness (also with
+  `brightness_step_pct`) sets every member to that brightness: normal
+  lights to the matching level, strips to their colour at that brightness
+  (brightest channel at the target). Strips are no longer scaled relative to
+  the brightest member - with 0.3.2 holding Dim down on DALI All dimmed only
+  the strips (every step went to 80 % of "full") and Dim up never brought
+  strips back up while other lights were at full.
+- **One gear does not pin a group.** A group / DALI All reports the
+  brightness it set while most members are still there; otherwise the level
+  most members are at, not the brightest member. A gear that does not follow
+  (stuck at full, raised min level) no longer makes every step start at 255.
+- **Readbacks cut short by the next step no longer revert it.** Levels read
+  before a newer write are dropped when the readback is merged.
+- DALI All always addresses its members one by one (no group DAPC
+  shortcut), so it behaves the same whatever the group setup on the bus.
+  Stale rewrites (superseded by a newer command) are not sent.
+
 ### 0.3.2
 
 - Fix `DALI All` dimming only once with `brightness_step` (Hue dimmer held):
