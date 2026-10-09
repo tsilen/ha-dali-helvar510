@@ -59,6 +59,14 @@ class SimBus:
         # like real IEC 62386-102 gear.
         self.fade_s: dict[int, float] = {}
         self._fades: dict[int, tuple[int, int, float, float]] = {}
+        # Fault injection: drop[sa] = number of upcoming arc frames to sa
+        # that the gear does not take (frame lost on the bus, the 510 still
+        # reports "sent"); swallow_frames = number of upcoming DALI frames
+        # the 510 does not answer at all (driver times out).
+        self.drop: dict[int, int] = {}
+        self.swallow_frames = 0
+        self.arc_frames = 0                   # DAPC / arc commands seen
+        self.queries = 0                      # frames expecting a reply
         self.groups = {sa: sum(1 << g for g in v["groups"]) for sa, v in self.gear.items()}
         self.twice_bit_works = True
         self.silent = False                   # stop answering (timeout tests)
@@ -116,7 +124,8 @@ class SimBus:
         if is_cmd and data >= 0xE0 and dt_enabled is None:
             self.violations.append(f"application extended command without ENABLE DT {live.hex()}")
         if not ctl & 0x04:  # no reply expected: DAPC / arc command
-            targets = self._targets(addr)
+            self.arc_frames += 1
+            targets = [sa for sa in self._targets(addr) if not self._dropped(sa)]
             if not is_cmd:
                 for sa in targets:
                     self._set_level(sa, 0 if data == 0 else data, fade=True)
@@ -127,6 +136,7 @@ class SimBus:
                 for sa in targets:
                     self._set_level(sa, 254, fade=False)  # RECALL MAX too
             return STATUS_OK
+        self.queries += 1
         sa = addr >> 1
         if addr >= 0x80 or sa not in self.gear:
             return NO_REPLY
@@ -140,10 +150,10 @@ class SimBus:
             0x91: 0xFF,               # QUERY CONTROL GEAR PRESENT
             0x97: 0x08,               # QUERY VERSION NUMBER
             0x99: g["dt"],            # QUERY DEVICE TYPE
-            0x9A: 1,                  # QUERY PHYSICAL MINIMUM
+            0x9A: g.get("phys_min", 1),  # QUERY PHYSICAL MINIMUM
             0xA0: level,              # QUERY ACTUAL LEVEL
-            0xA1: 254,                # QUERY MAX LEVEL
-            0xA2: 1,                  # QUERY MIN LEVEL
+            0xA1: g.get("max", 254),  # QUERY MAX LEVEL
+            0xA2: g.get("min", 1),    # QUERY MIN LEVEL
             0xC0: self.groups[sa] & 0xFF,
             0xC1: self.groups[sa] >> 8,
             0xC2: g["rand"] >> 16,
@@ -154,7 +164,21 @@ class SimBus:
             return reply(table[data])
         return NO_REPLY
 
+    def _dropped(self, sa: int) -> bool:
+        if self.drop.get(sa, 0) > 0:
+            self.drop[sa] -= 1
+            return True
+        return False
+
     def _set_level(self, sa: int, target: int, *, fade: bool) -> None:
+        g = self.gear[sa]
+        if g.get("deaf"):
+            # gear that does not follow (lost frame, emergency / switched
+            # gear, wrongly addressed ...): its level never changes
+            return
+        if target > 0:  # DALI: arc levels are clamped to MIN / MAX LEVEL
+            lo = max(g.get("min", 1), g.get("hidden_min", 1))  # hidden_min: not in QUERY MIN LEVEL
+            target = max(lo, min(g.get("max", 254), target))
         start = self.actual(sa)
         fade_s = self.fade_s.get(sa, 0.0) if fade else 0.0
         self.levels[sa] = target
@@ -194,6 +218,9 @@ class SimBus:
                 live = rep[: 1 + rep[0]]
                 self.log.append(live)
                 if self.silent:
+                    continue
+                if self.swallow_frames > 0 and live[:1] == b"\x03":
+                    self.swallow_frames -= 1
                     continue
                 ans = self.answer(live)
                 try:
