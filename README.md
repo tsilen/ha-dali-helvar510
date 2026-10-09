@@ -223,9 +223,19 @@ is a description in our own words, not vendor documentation.
 
 ## Development
 
+Requires Python 3.14.2 or newer (same as Home Assistant 2026.10).
+
 ```bash
-pip install -r requirements_test.txt
+pip install --require-hashes -r requirements_test.txt
 pytest
+```
+
+`requirements_test.txt` is a fully pinned, hashed lock file. To change the
+test dependencies, edit `requirements_test.in` and regenerate the lock file:
+
+```bash
+uv pip compile requirements_test.in --universal --python-version 3.14.2 \
+  --generate-hashes -o requirements_test.txt
 ```
 
 The tests run the real driver against a simulated 510 and DALI bus with

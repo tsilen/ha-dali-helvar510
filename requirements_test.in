@@ -1,0 +1,6 @@
+# Top-level test dependencies (exact pins).
+# requirements_test.txt is the fully pinned, hashed lock file generated from this file:
+#   uv pip compile requirements_test.in --universal --python-version 3.14.2 --generate-hashes -o requirements_test.txt
+# pytest-homeassistant-custom-component 0.13.371 pins homeassistant==2026.10.0.
+pytest-homeassistant-custom-component==0.13.371
+pytest-timeout==2.4.0
