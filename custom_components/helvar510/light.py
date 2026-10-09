@@ -7,6 +7,7 @@ light; group member lights live on the hub. unique_ids are exactly the 0.1.0 one
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from homeassistant.components.light import (
@@ -35,7 +36,6 @@ from .dali510 import (
     BROADCAST_CMD,
     BROADCAST_DAPC,
     arc_to_brightness,
-    arc_to_percent,
     arcs_to_colour,
     brightness_to_arc,
     default_strip_colour,
@@ -61,6 +61,8 @@ from .devices import (
 # Colour difference (0-255 scale, per component) above which a colour seen on
 # the bus is treated as a real change (e.g. another controller or a wall panel) and learnt.
 LEARN_TOLERANCE = 12
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -616,47 +618,82 @@ class _MultiLight(_HelvarBase):
         lv = [v for v in self._member_levels() if v is not None]
         if not lv:
             return None
-        # Represent brightness as max member (common UX)
-        bri = arc_to_brightness(max(lv))
-        if bri and (cmd := self._commanded_brightness()) is not None:
-            bri = cmd
+        lit = [v for v in lv if v > 0]
+        if not lit:
+            return 0
+        # A group / DALI All sets every member to one brightness: report that
+        # while most members are still where it put them. Otherwise report
+        # the level most members are at - not the brightest member, so one
+        # gear that does not follow (stuck at full, raised min level) cannot
+        # pin the whole group and make every step start from 255.
+        bri = self._commanded_brightness()
+        if bri is None:
+            bri = self._typical_brightness(lit)
         if bri:
             self._last_brightness = bri
+        return bri
+
+    def _typical_brightness(self, lit: list[int]) -> int:
+        """Brightness most lit non-strip members are at (strips report
+        their colour, not their brightness, per channel)."""
+        data = self.coordinator.data or {}
+        plain = [
+            data.get(sa) for sa in self._members()
+            if sa not in self.strip_channels and (data.get(sa) or 0) > 0
+        ]
+        pool = plain or lit
+        counts: dict[int, int] = {}
+        for v in pool:
+            counts[v] = counts.get(v, 0) + 1
+        level = max(counts, key=lambda v: (counts[v], v))
+        return arc_to_brightness(level)
+
+    def _commanded_brightness(self) -> int | None:
+        """The brightness last set, while the majority of members still are
+        at the level it put them at (or settled at in answer to it)."""
+        if self._commanded is None:
+            return None
+        coord = self.coordinator
+        data = coord.data or {}
+        levels, seqs, bri = self._commanded
+        sas = self._brightness_sas()
+        if len(sas) != len(levels):
+            return None
+        same = other = 0
+        for sa, want, seq in zip(sas, levels, seqs):
+            cur = data.get(sa)
+            if cur is None:
+                continue
+            if cur == want or (
+                coord.command_seq(sa) == seq and coord.settled_level(sa, seq) == cur
+            ):
+                same += 1
+            else:
+                other += 1
+        if same == 0 or other > same:
+            return None
         return bri
 
     def _has_strip_members(self) -> bool:
         return bool(set(self._members()) & self.strip_channels)
 
     async def _apply_plan(self, target_bri: int) -> None:
-        """Per-address DAPC: on strips keep colour, off strips get last colour."""
-        data = self.coordinator.data or {}
-        members = self._members()
-        # Current brightness of the brightest member, unrounded (0-255 float),
-        # so strips are scaled by exactly target/current.
-        cur_bri = max(
-            (
-                arc_to_percent(lv) * 255.0 / 100.0
-                for lv in (data.get(sa) or 0 for sa in members)
-                if 0 < lv != 0xFF
-            ),
-            default=0.0,
-        ) or self._last_brightness or 255
+        """Every member to `target_bri`, per short address (verified).
+
+        Strips get their colour at that brightness, other gear the matching
+        arc level. Per-address frames only: each one is verified after it
+        settled (0.3.2 also used group DAPC for DALI All; group frames are
+        not verified per gear and, when they did not take, grouped lights
+        stayed behind while a dimmer button was held).
+        """
         coord = self.coordinator
-        plan = coord.plan_levels(members, target_bri, cur_bri)
-        rest = dict(plan)
-        for gnum, gmembers in self._group_frames(plan):
-            # one group DAPC instead of one frame per member
-            await coord.async_dapc(group_dapc_addr(gnum), plan[gmembers[0]])
-            coord.commit_levels({sa: plan[sa] for sa in gmembers}, notify=False)
-            for sa in gmembers:
-                rest.pop(sa, None)
-        await coord.async_write_levels(rest)
+        plan = coord.plan_levels(self._members(), target_bri)
+        _LOGGER.debug(
+            "%s: brightness %s -> %s per-address frames", self.entity_id, target_bri, len(plan)
+        )
+        await coord.async_write_levels(plan)
         self._remember_command(plan, target_bri)
         coord.async_update_listeners()
-
-    def _group_frames(self, plan: dict[int, int]) -> list[tuple[int, list[int]]]:
-        """DALI groups that can take one group DAPC for this plan."""
-        return []
 
 
 class DaliGroupLight(_MultiLight):
@@ -723,27 +760,6 @@ class DaliBroadcastLight(_MultiLight):
 
     def _members(self) -> list[int]:
         return list(self.coordinator.gear_by_sa)
-
-    def _group_frames(self, plan: dict[int, int]) -> list[tuple[int, list[int]]]:
-        """For DALI All: groups without strip channels whose members all get
-        the same level take one group DAPC (fewer frames per step on the
-        slow bus). Only used for the broadcast light, which addresses every
-        gear on the bus anyway."""
-        out: list[tuple[int, list[int]]] = []
-        used: set[int] = set()
-        groups = sorted(self.coordinator.groups.items(), key=lambda kv: -len(kv[1]))
-        for gnum, gmembers in groups:
-            if len(gmembers) < 2 or set(gmembers) & (self.strip_channels | used):
-                continue
-            if any(sa not in plan for sa in gmembers):
-                continue
-            if len({plan[sa] for sa in gmembers}) != 1:
-                continue
-            # every gear in this group must be fully covered by it: a gear in
-            # two groups would get the frame twice - harmless (same level)
-            out.append((gnum, list(gmembers)))
-            used.update(gmembers)
-        return out
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         # Broadcast DAPC would wreck strip colours - with strips, address

@@ -134,6 +134,7 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         # latest wins while not yet sent.
         self._wq: dict[int, tuple[int, bool]] = {}
         self._wq_waiters: list[asyncio.Future] = []
+        self._wq_gens: dict[int, int] = {}  # rewrite -> gen it was decided at
         self._writer: asyncio.Task | None = None
         # frame counters (diagnostics / tests)
         self.stats: dict[str, int] = {"dapc_frames": 0, "group_frames": 0,
@@ -188,38 +189,30 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
                 )
                 mem["arcs"] = [levels[sa] for sa in sas]
 
-    def plan_levels(
-        self, members: list[int], target_bri: int, cur_bri: int
-    ) -> dict[int, int]:
-        """Per-address arc levels for a group/All 'on' that keeps strip colours.
+    def plan_levels(self, members: list[int], target_bri: int) -> dict[int, int]:
+        """Per-address arc levels for a group / DALI All brightness.
 
-        * strip that is ON  -> its channels scaled by target/cur (colour kept)
-        * strip that is OFF -> lit with its last colour at target brightness
-        * other gear        -> absolute level for target brightness
+        A group or DALI All is one light: setting its brightness sets every
+        member to that brightness.
+        * strip  -> its colour (the current one, kept normalised in the
+                    strip memory) at target brightness, so its brightest
+                    channel is at the target - at 255 the strip is at full
+        * other gear -> the arc level for the target brightness
+        (0.3.2 and older scaled strips relative to the brightest member, so a
+        strip never got brighter while other lights were at full, and one
+        member stuck at full kept dimming only the strips.)
         """
-        from .dali510 import arc_to_percent, brightness_to_arc, percent_to_arc
+        from .dali510 import brightness_to_arc
 
-        data = self.data or {}
         member_set = set(members)
         plan: dict[int, int] = {}
         for strip in self.strips:
             chans = [sa for sa in strip["channels"].values() if sa in member_set]
             if not chans:
                 continue
-            strip_on = any((data.get(sa) or 0) > 0 for sa in strip["channels"].values())
-            if strip_on:
-                for sa in chans:
-                    lv = data.get(sa) or 0
-                    if 0 < lv != 0xFF and cur_bri > 0:
-                        plan[sa] = percent_to_arc(
-                            arc_to_percent(lv) * (target_bri / cur_bri)
-                        )
-                    else:
-                        plan[sa] = 0
-            else:
-                arcs = self.strip_on_arcs(strip, target_bri)
-                for sa in chans:
-                    plan[sa] = arcs.get(sa, 0)
+            arcs = self.strip_on_arcs(strip, target_bri)
+            for sa in chans:
+                plan[sa] = arcs.get(sa, 0)
         arc = brightness_to_arc(target_bri)
         for sa in members:
             if sa not in plan:
@@ -235,6 +228,8 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         (the worker thread finishes on its own, later calls queue behind it).
         """
         async with self._lock:
+            if getattr(self, "_closed", False):
+                raise Dali510Error("integration is shutting down")
             loop = asyncio.get_running_loop()
             fut = loop.run_in_executor(
                 self._executor, functools.partial(func, *args, **kwargs)
@@ -289,11 +284,13 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         fading: list[int] = []
         errors = 0
         rewrites: dict[int, int] = {}
+        read_gen: dict[int, int] = {}
         for gear in self.gears:
             sa = gear["sa"]
             await self._wait_quiet()
             try:
                 result, level = await self._read_actual(sa)
+                read_gen[sa] = self._gen.get(sa, 0)
             except Dali510Error as err:
                 errors += 1
                 _LOGGER.debug("poll sa %s failed: %s", sa, err)
@@ -320,8 +317,9 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         if rewrites:
             self._start_rewrite(rewrites)
         # Merge into the *current* data: commands sent while this poll was
-        # running must not be overwritten by the snapshot taken at its start.
-        return {**(self.data or {}), **updates}
+        # running must not be overwritten by the snapshot taken at its start,
+        # nor by a level read before a newer write (a poll takes many seconds).
+        return {**(self.data or {}), **self._fresh(updates, read_gen)}
 
     async def _read_actual(self, sa: int) -> tuple[str, int | None]:
         """QUERY ACTUAL LEVEL of one address, guarded against stale values.
@@ -388,15 +386,25 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
 
     @callback
     def _start_rewrite(self, levels: dict[int, int]) -> None:
+        # only while nothing newer was written to the address since the
+        # readback decided (a rewrite must never send an old target)
+        gens = {sa: self._gen.get(sa, 0) for sa in levels}
         self.stats["rewrites"] += len(levels)
         _LOGGER.debug("rewriting %s (level not taken)", levels)
 
         async def _go() -> None:
+            todo = {
+                sa: lvl for sa, lvl in levels.items()
+                if self._gen.get(sa, 0) == gens[sa]
+                and (self._pending.get(sa) or (None,))[0] == lvl
+            }
+            if not todo:
+                return
             try:
-                await self.async_write_levels(levels, rewrite=True)
+                await self.async_write_levels(todo, rewrite=True, gens=gens)
             except Dali510Error as err:
                 _LOGGER.debug("rewrite failed: %s", err)
-            self.schedule_refresh(list(levels), VERIFY_DELAY_S)
+            self.schedule_refresh(list(todo), VERIFY_DELAY_S)
 
         self.hass.async_create_task(_go())
 
@@ -417,6 +425,7 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         updates: dict[int, int | None] = {}
         fading: list[int] = []
         rewrites: dict[int, int] = {}
+        read_gen: dict[int, int] = {}
         sas = list(sas)
         for i, sa in enumerate(sas):
             if defer and self._busy():
@@ -426,6 +435,7 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
                 break
             try:
                 result, level = await self._read_actual(sa)
+                read_gen[sa] = self._gen.get(sa, 0)
             except Dali510Error as err:
                 _LOGGER.debug("refresh sa %s failed: %s", sa, err)
                 continue
@@ -441,9 +451,29 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
             self.schedule_refresh(fading, FADE_RECHECK_S)
         if rewrites:
             self._start_rewrite(rewrites)
-        # merge into the current data (never write back an old snapshot)
+        # merge into the current data (never write back an old snapshot):
+        # a level read before a write that went out since (the readback was
+        # cut short by the next brightness step) is dropped
+        updates = self._fresh(updates, read_gen)
         if updates:
             self.async_set_updated_data({**(self.data or {}), **updates})
+
+    def _fresh(
+        self, updates: dict[int, int | None], read_gen: dict[int, int]
+    ) -> dict[int, int | None]:
+        out = {
+            sa: lvl for sa, lvl in updates.items()
+            if read_gen.get(sa, self._gen.get(sa, 0)) == self._gen.get(sa, 0)
+        }
+        if len(out) != len(updates):
+            self.stats["stale_dropped"] = self.stats.get("stale_dropped", 0) + (
+                len(updates) - len(out)
+            )
+            _LOGGER.debug(
+                "readback dropped (written since): %s",
+                sorted(set(updates) - set(out)),
+            )
+        return out
 
     @callback
     def schedule_refresh(self, sas: list[int], delay: float = REFRESH_DELAY_S) -> None:
@@ -547,7 +577,8 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
 
     # ------------------------------------------------------------ write queue
     async def async_write_levels(
-        self, levels: dict[int, int], *, rewrite: bool = False
+        self, levels: dict[int, int], *, rewrite: bool = False,
+        gens: dict[int, int] | None = None,
     ) -> None:
         """Write per-address arc levels (0 = OFF) through the serialised queue.
 
@@ -564,6 +595,10 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
             if rewrite and prev is not None and not prev[1]:
                 continue
             self._wq[sa] = (int(lvl), rewrite)
+            if rewrite and gens is not None:
+                self._wq_gens[sa] = gens.get(sa, 0)
+            else:
+                self._wq_gens.pop(sa, None)
         fut = asyncio.get_running_loop().create_future()
         self._wq_waiters.append(fut)
         if self._writer is None or self._writer.done():
@@ -580,11 +615,17 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
     async def _async_writer(self) -> None:
         while self._wq:
             batch, self._wq = self._wq, {}
+            gens, self._wq_gens = self._wq_gens, {}
             waiters, self._wq_waiters = self._wq_waiters, []
             data = self.data or {}
             send: dict[int, tuple[int, bool]] = {}
             for sa, (lvl, rewrite) in batch.items():
                 clamped = self.clamp_levels({sa: lvl})[sa]
+                if rewrite and (
+                    (sa in gens and self._gen.get(sa, 0) != gens[sa])
+                    or (self._pending.get(sa) or (None,))[0] != clamped
+                ):
+                    continue  # superseded by a newer write
                 if (not rewrite and sa not in self._pending
                         and data.get(sa) is not None and data.get(sa) == clamped):
                     # bus already confirmed at this level: no frame needed

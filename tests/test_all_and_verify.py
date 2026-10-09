@@ -177,11 +177,10 @@ async def test_all_held_button_real_timing(hass: HomeAssistant, tsim) -> None:
             await asyncio.sleep(max(0.0, 0.8 - (time.monotonic() - t0)))
             seen.append(_bri(hass, allx))
         assert seen == _steps(seen[0], d, n), (d, seen)
-    # DALI All with 4 strips: 39 gear, groups G0-G4 (18 gear, no strip
-    # channels) take one group DAPC each -> 5 + 21 = 26 frames per step at
-    # most (fewer when strip channels at 0 stay at 0); no readback queries
-    # while the button is held.
-    assert all(a <= 26 for a, _q in frames), frames
+    # DALI All: one verified per-address frame per gear (39) at most, fewer
+    # when levels are already confirmed (strip channels staying at 0); no
+    # readback queries while the button is held.
+    assert all(a <= 39 for a, _q in frames), frames
     assert all(q == 0 for _a, q in frames[1:]), frames
     assert tsim.violations == [] and tsim.config_writes == []
     await _unload(hass, entry)
