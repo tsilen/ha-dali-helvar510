@@ -40,6 +40,17 @@ REFRESH_MAX_DEFER_S = 6.0
 PENDING_MAX_S = 95.0
 FADE_RECHECK_S = 2.0
 STATUS_FADE_RUNNING = 0x10
+# Post-write verification: a level that settled (no fade running) at
+# something other than commanded is written again at most this many times.
+VERIFY_RETRIES = 2
+VERIFY_DELAY_S = 1.0
+# Readbacks / polls wait while commands are flowing (held dimmer button):
+# the bus (1200 baud, ~25-40 ms per frame) is better spent on the writes.
+QUIET_S = 1.0
+QUIET_MAX_WAIT_S = 10.0
+# Per-address writes are sent in transactions of this many frames so that
+# other bus users can get in between.
+WRITE_CHUNK = 8
 CMD_QUERY_STATUS = 0x90
 CMD_QUERY_ACTUAL_LEVEL = 0xA0
 
@@ -109,6 +120,24 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         # Bumped on every command per short address; a readback whose query
         # started before a newer command is stale and dropped.
         self._cmd_seq: dict[int, int] = {}
+        # sa -> (command seq, level): the readback that settled command `seq`
+        # showed a level other than commanded (gear clamped it, a frame was
+        # lost, the gear does not follow). That level is the gear's answer
+        # to our command, not a change made by someone else.
+        self._settled: dict[int, tuple[int, int]] = {}
+        # Bumped on every write to an address (also verification rewrites);
+        # a readback whose query started before a write is stale.
+        self._gen: dict[int, int] = {}
+        self._retries: dict[int, int] = {}
+        self._last_write = 0.0
+        # Serialised per-address write queue: sa -> (level, is_rewrite);
+        # latest wins while not yet sent.
+        self._wq: dict[int, tuple[int, bool]] = {}
+        self._wq_waiters: list[asyncio.Future] = []
+        self._writer: asyncio.Task | None = None
+        # frame counters (diagnostics / tests)
+        self.stats: dict[str, int] = {"dapc_frames": 0, "group_frames": 0,
+                                      "queries": 0, "rewrites": 0, "skipped": 0}
 
     # ------------------------------------------------------------ helpers
     @property
@@ -234,6 +263,8 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
             h.cancel()
         self._refresh_handles = []
         self._refresh_sas.clear()
+        if self._writer is not None and not self._writer.done():
+            self._writer.cancel()
         try:
             await super().async_shutdown()
         except AttributeError:
@@ -257,8 +288,10 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         updates: dict[int, int | None] = {}
         fading: list[int] = []
         errors = 0
+        rewrites: dict[int, int] = {}
         for gear in self.gears:
             sa = gear["sa"]
+            await self._wait_quiet()
             try:
                 result, level = await self._read_actual(sa)
             except Dali510Error as err:
@@ -277,11 +310,15 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
                     updates[sa] = level
                 elif result == "fading":
                     fading.append(sa)
+                elif result == "rewrite":
+                    rewrites[sa] = level
             await asyncio.sleep(POLL_STAGGER_S)
         if self.gears and errors == len(self.gears):
             raise UpdateFailed("no gear answered")
         if fading:
             self.schedule_refresh(fading, FADE_RECHECK_S)
+        if rewrites:
+            self._start_rewrite(rewrites)
         # Merge into the *current* data: commands sent while this poll was
         # running must not be overwritten by the snapshot taken at its start.
         return {**(self.data or {}), **updates}
@@ -295,10 +332,14 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
           "keep"   -> MASK answer (unknown), keep the previous value,
           "fading" -> differs from what we commanded and the gear says a
                       fade is running: keep the commanded target, re-check,
-          "stale"  -> a newer command was sent while querying: drop it.
+          "stale"  -> a newer write was sent while querying: drop it,
+          "rewrite"-> settled (no fade) at something other than commanded:
+                      level = the commanded level to write again.
         Only queries (0xA0 / 0x90) are sent.
         """
+        gen = self._gen.get(sa, 0)
         seq = self._cmd_seq.get(sa, 0)
+        self.stats["queries"] += 1
         level = await self._run(self.bus.query_short, sa, CMD_QUERY_ACTUAL_LEVEL)
         if level is None:
             return "silent", None
@@ -307,23 +348,82 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         pending = self._pending.get(sa)
         if pending is not None and level != pending[0]:
             if time.monotonic() - pending[1] < PENDING_MAX_S:
+                self.stats["queries"] += 1
                 status = await self._run(self.bus.query_short, sa, CMD_QUERY_STATUS)
+                if self._gen.get(sa, 0) != gen:
+                    return "stale", None
                 if status is None or status & STATUS_FADE_RUNNING:
-                    return ("stale" if self._cmd_seq.get(sa, 0) != seq else "fading"), None
-        if self._cmd_seq.get(sa, 0) != seq:
+                    return "fading", None
+            if self._gen.get(sa, 0) != gen:
+                return "stale", None
+            tries = self._retries.get(sa, 0)
+            if tries < VERIFY_RETRIES:
+                # lost / ignored frame: write the commanded level again
+                self._retries[sa] = tries + 1
+                return "rewrite", pending[0]
+            _LOGGER.warning(
+                "DALI short address %s is at level %s, commanded %s "
+                "(still different after %s rewrites)",
+                sa, level, pending[0], tries,
+            )
+        if self._gen.get(sa, 0) != gen:
             return "stale", None
-        if self._pending.get(sa) is pending:
-            # confirmed, clamped by the gear, or changed by someone else
+        if pending is not None and self._pending.get(sa) is pending:
+            # confirmed, or the gear's own answer to the command
             self._pending.pop(sa, None)
+            self._retries.pop(sa, None)
+            if level != pending[0]:
+                self._settled[sa] = (seq, level)
         return "ok", level
+
+    async def _wait_quiet(self) -> None:
+        """Hold readbacks back while writes are flowing (bounded)."""
+        waited = 0.0
+        while waited < QUIET_MAX_WAIT_S and self._busy():
+            await asyncio.sleep(0.2)
+            waited += 0.2
+
+    def _busy(self) -> bool:
+        return bool(self._wq) or (time.monotonic() - self._last_write) < QUIET_S
+
+    @callback
+    def _start_rewrite(self, levels: dict[int, int]) -> None:
+        self.stats["rewrites"] += len(levels)
+        _LOGGER.debug("rewriting %s (level not taken)", levels)
+
+        async def _go() -> None:
+            try:
+                await self.async_write_levels(levels, rewrite=True)
+            except Dali510Error as err:
+                _LOGGER.debug("rewrite failed: %s", err)
+            self.schedule_refresh(list(levels), VERIFY_DELAY_S)
+
+        self.hass.async_create_task(_go())
+
+    def command_seq(self, sa: int) -> int:
+        return self._cmd_seq.get(sa, 0)
+
+    def settled_level(self, sa: int, seq: int) -> int | None:
+        """Level the bus settled at for command `seq` if it differed."""
+        got = self._settled.get(sa)
+        if got is not None and got[0] == seq:
+            return got[1]
+        return None
 
     def is_available(self, sa: int) -> bool:
         return self.fail_count.get(sa, 0) < FAIL_LIMIT
 
-    async def async_refresh_addresses(self, sas: list[int]) -> None:
+    async def async_refresh_addresses(self, sas: list[int], *, defer: bool = True) -> None:
         updates: dict[int, int | None] = {}
         fading: list[int] = []
-        for sa in sas:
+        rewrites: dict[int, int] = {}
+        sas = list(sas)
+        for i, sa in enumerate(sas):
+            if defer and self._busy():
+                # commands are flowing: read the rest back once they stop
+                self._refresh_first = None
+                self.schedule_refresh(sas[i:], QUIET_S)
+                break
             try:
                 result, level = await self._read_actual(sa)
             except Dali510Error as err:
@@ -334,9 +434,13 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
                 self.fail_count[sa] = 0
             elif result == "fading":
                 fading.append(sa)
+            elif result == "rewrite":
+                rewrites[sa] = level
             await asyncio.sleep(POLL_STAGGER_S)
         if fading:
             self.schedule_refresh(fading, FADE_RECHECK_S)
+        if rewrites:
+            self._start_rewrite(rewrites)
         # merge into the current data (never write back an old snapshot)
         if updates:
             self.async_set_updated_data({**(self.data or {}), **updates})
@@ -382,7 +486,9 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         return out
 
     @callback
-    def commit_levels(self, levels: dict[int, int | None]) -> dict[int, int | None]:
+    def commit_levels(
+        self, levels: dict[int, int | None], *, rewrite: bool = False, notify: bool = True
+    ) -> dict[int, int | None]:
         """Record levels just written to the bus and show them immediately.
 
         The commanded level stays authoritative until the bus confirms it (or
@@ -392,14 +498,24 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         """
         clamped = self.clamp_levels(levels)
         now = time.monotonic()
+        self._last_write = now
         for sa, lvl in clamped.items():
-            self._cmd_seq[sa] = self._cmd_seq.get(sa, 0) + 1
+            self._gen[sa] = self._gen.get(sa, 0) + 1
+            if not rewrite:
+                # a new command (a rewrite keeps the command it repeats)
+                self._cmd_seq[sa] = self._cmd_seq.get(sa, 0) + 1
+                self._settled.pop(sa, None)
+                self._retries.pop(sa, None)
             if lvl is None:
                 self._pending.pop(sa, None)
             else:
                 self._pending[sa] = (lvl, now)
-        self.note_commanded({sa: v for sa, v in clamped.items() if v is not None})
-        self.async_set_updated_data({**(self.data or {}), **clamped})
+        if not rewrite:
+            self.note_commanded({sa: v for sa, v in clamped.items() if v is not None})
+        if notify:
+            self.async_set_updated_data({**(self.data or {}), **clamped})
+        else:
+            self.data = {**(self.data or {}), **clamped}
         return clamped
 
     @callback
@@ -408,16 +524,105 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
 
     # ------------------------------------------------------------ commands
     async def async_dapc(self, addr_byte: int, level: int) -> Reply:
+        """Group / broadcast / short DAPC, after queued per-address writes."""
         await self._ensure_open()
+        await self._async_flush_writes()
+        self.stats["group_frames"] += 1
+        self._last_write = time.monotonic()
         return await self._run(self.bus.dapc, addr_byte, level)
 
     async def async_command(self, addr_byte: int, cmd: int) -> Reply:
         await self._ensure_open()
+        await self._async_flush_writes()
+        self.stats["group_frames"] += 1
+        self._last_write = time.monotonic()
         return await self._run(self.bus.command, addr_byte, cmd)
 
     async def async_dapc_many(self, items: list[tuple[int, int]]) -> list[Reply]:
         await self._ensure_open()
+        await self._async_flush_writes()
+        self.stats["dapc_frames"] += len(items)
+        self._last_write = time.monotonic()
         return await self._run(self.bus.dapc_many, items)
+
+    # ------------------------------------------------------------ write queue
+    async def async_write_levels(
+        self, levels: dict[int, int], *, rewrite: bool = False
+    ) -> None:
+        """Write per-address arc levels (0 = OFF) through the serialised queue.
+
+        Levels for an address that is still queued are replaced (latest
+        wins), so concurrent / rapid commands do not pile up on the slow bus.
+        Returns once the levels (or newer ones) were sent and committed.
+        """
+        if not levels:
+            return
+        await self._ensure_open()
+        for sa, lvl in levels.items():
+            prev = self._wq.get(sa)
+            # a rewrite never replaces a newer real command
+            if rewrite and prev is not None and not prev[1]:
+                continue
+            self._wq[sa] = (int(lvl), rewrite)
+        fut = asyncio.get_running_loop().create_future()
+        self._wq_waiters.append(fut)
+        if self._writer is None or self._writer.done():
+            self._writer = self.hass.async_create_background_task(
+                self._async_writer(), "helvar510 writer"
+            )
+        await fut
+
+    async def _async_flush_writes(self) -> None:
+        writer = self._writer
+        if writer is not None and not writer.done():
+            await asyncio.shield(writer)
+
+    async def _async_writer(self) -> None:
+        while self._wq:
+            batch, self._wq = self._wq, {}
+            waiters, self._wq_waiters = self._wq_waiters, []
+            data = self.data or {}
+            send: dict[int, tuple[int, bool]] = {}
+            for sa, (lvl, rewrite) in batch.items():
+                clamped = self.clamp_levels({sa: lvl})[sa]
+                if (not rewrite and sa not in self._pending
+                        and data.get(sa) is not None and data.get(sa) == clamped):
+                    # bus already confirmed at this level: no frame needed
+                    self.stats["skipped"] += 1
+                    continue
+                send[sa] = (lvl, rewrite)
+            err: BaseException | None = None
+            items = sorted(send.items())
+            try:
+                for i in range(0, len(items), WRITE_CHUNK):
+                    chunk = items[i : i + WRITE_CHUNK]
+                    self.stats["dapc_frames"] += len(chunk)
+                    self._last_write = time.monotonic()
+                    await self._run(
+                        self.bus.dapc_many,
+                        [(sa << 1, lvl) for sa, (lvl, _r) in chunk],
+                    )
+                    self.commit_levels(
+                        {sa: lvl for sa, (lvl, r) in chunk if not r}, notify=False
+                    )
+                    self.commit_levels(
+                        {sa: lvl for sa, (lvl, r) in chunk if r}, rewrite=True, notify=False
+                    )
+            except (Dali510Error, asyncio.CancelledError) as e:  # noqa: PERF203
+                err = e
+            for fut in waiters:
+                if fut.done():
+                    continue
+                if err is None:
+                    fut.set_result(None)
+                elif isinstance(err, asyncio.CancelledError):
+                    fut.cancel()
+                else:
+                    fut.set_exception(err)
+            # after the waiting entities ran (they remember what they set)
+            asyncio.get_running_loop().call_soon(self.async_update_listeners)
+            if isinstance(err, asyncio.CancelledError):
+                raise err
 
     async def async_send_raw(self, addr: int, data: int, expect_reply: bool) -> Reply:
         await self._ensure_open()

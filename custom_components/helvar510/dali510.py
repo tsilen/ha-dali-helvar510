@@ -591,15 +591,37 @@ class Dali510:
     def command(self, addr_byte: int, cmd: int) -> Reply:
         return self.send(addr_byte | 1, cmd)
 
-    def dapc_many(self, items: Iterable[tuple[int, int]]) -> list[Reply]:
-        """Several DAPC frames in one transaction (used for RGBW)."""
-        out = []
+    def dapc_many(self, items: Iterable[tuple[int, int]], retries: int = 1) -> list[Reply]:
+        """Several DAPC frames in one transaction (used for RGBW).
+
+        A frame the 510 does not acknowledge in time no longer aborts the
+        rest (that left strips with some channels changed and others not):
+        every frame is sent, unacknowledged ones are sent again (`retries`
+        times). Raises Dali510Timeout only if no frame was acknowledged.
+        """
+        items = list(items)
+        out: list[Reply] = [Reply(0) for _ in items]
+        todo = list(range(len(items)))
         with self.transaction() as tx:
-            for addr_byte, level in items:
-                if level <= 0:
-                    out.append(tx.frame(addr_byte | 1, 0x00, False))  # OFF
-                else:
-                    out.append(tx.frame(addr_byte & 0xFE, min(254, level), False))
+            for _attempt in range(1 + max(0, retries)):
+                failed = []
+                for i in todo:
+                    addr_byte, level = items[i]
+                    try:
+                        if level <= 0:
+                            r = tx.frame(addr_byte | 1, 0x00, False)  # OFF
+                        else:
+                            r = tx.frame(addr_byte & 0xFE, min(254, level), False)
+                    except Dali510Timeout:
+                        _LOGGER.debug("no ack for frame %02x %02x", addr_byte, level)
+                        failed.append(i)
+                        continue
+                    out[i] = r
+                if not failed:
+                    break
+                todo = failed
+        if items and all(r.status == 0 for r in out):
+            raise Dali510Timeout("510 acknowledged none of the frames")
         return out
 
     # ---------------- group membership (explicit, narrow) ----------------

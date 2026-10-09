@@ -82,7 +82,7 @@ async def test_set_brightness_reports_exactly_what_was_set(hass: HomeAssistant, 
             await _turn_on(hass, eid, brightness=b)
             assert _bri(hass, eid) == b, (eid, b)
             # a readback of the same bus levels must not change the reported value
-            await entry.runtime_data.async_refresh_addresses(sas)
+            await entry.runtime_data.async_refresh_addresses(sas, defer=False)
             await hass.async_block_till_done()
             assert _bri(hass, eid) == b, (eid, b, "after readback")
     assert sim.violations == []
@@ -164,7 +164,7 @@ async def test_step_during_fade_is_not_pulled_back(hass: HomeAssistant, sim) -> 
         await _turn_on(hass, eid, brightness_step_pct=10)
         await _turn_on(hass, grp, brightness_step_pct=10)
         # readback / poll while the gear is still fading
-        await coord.async_refresh_addresses([7, 8, 12])
+        await coord.async_refresh_addresses([7, 8, 12], defer=False)
         await coord.async_refresh()
         await hass.async_block_till_done()
         seen.append(_bri(hass, eid))
@@ -188,6 +188,10 @@ async def test_external_change_is_still_learnt(hass: HomeAssistant, sim) -> None
     coord = entry.runtime_data
     eid = _eid(hass, entry, sa_unique_id(12))
     await _turn_on(hass, eid, brightness=128)
+    # our command is verified first ...
+    await coord.async_refresh_addresses([12], defer=False)
+    assert 12 not in coord._pending
+    # ... then a wall panel changes the level
     sim.levels[12] = 254
     await coord.async_refresh()
     await hass.async_block_till_done()
@@ -206,7 +210,7 @@ async def test_readback_snapshot_does_not_revert_other_lights(hass: HomeAssistan
     await _turn_on(hass, b, brightness=51)
 
     # refresh of another address in flight while b is stepped up
-    task = hass.async_create_task(coord.async_refresh_addresses([10, 11]))
+    task = hass.async_create_task(coord.async_refresh_addresses([10, 11], defer=False))
     await asyncio.sleep(0)
     await _turn_on(hass, b, brightness_step_pct=10)
     await task

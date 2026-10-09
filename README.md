@@ -44,6 +44,12 @@ lighting through a **Helvar DIGIDIM 510 USB-DALI interface** (USB ID
   immediately; a readback taken while the gear is still fading (DALI fade
   time) does not pull it back, so `brightness_step` / dimmer remotes step
   smoothly.
+- **Verified writes:** after every per-address write (single lights, strip
+  on/off/colour/brightness, group and `DALI All` commands) the levels are
+  read back once the gear has settled; an address that did not take its
+  level (lost frame) is written again, at most twice, then a warning is
+  logged. Writes go through one serialised queue (latest level per address
+  wins) and readbacks wait while commands are flowing.
 - **Diagnostics** download with the scan result and the last bus frames
   (USB serial number redacted).
 
@@ -245,6 +251,27 @@ The tests run the real driver against a simulated 510 and DALI bus with
 synthetic gear (`tests/sim.py`).
 
 ## Changelog
+
+### 0.3.2
+
+- Fix `DALI All` dimming only once with `brightness_step` (Hue dimmer held):
+  a single gear not ending at the commanded level (clamped higher than its
+  reported minimum, a lost frame, gear that does not follow) made `DALI All`
+  report the brightest member again, so every step was computed from the
+  same value. The level a gear settles at in answer to a command is now
+  attributed to that command.
+- Fix strips changing colour when a channel frame was lost: a frame the 510
+  did not acknowledge aborted the remaining channels, and the half-applied
+  colour was then learnt. All channels are now sent (unacknowledged frames
+  retried), every write is verified and mismatching channels rewritten (at
+  most 2 times, then a warning), and a channel that did not take its level
+  is never learnt as a new colour.
+- Fewer frames per step: `DALI All` uses one group DAPC for groups without
+  strip channels whose members get the same level, and channels that are
+  already confirmed at the target level are not sent again (on a 39-gear
+  bus with 4 RGBW strips: 39 -> 18 frames per step for `DALI All`, 16 -> 8
+  for the 4 strips).
+- Readbacks and polls wait while commands are flowing.
 
 ### 0.3.1
 

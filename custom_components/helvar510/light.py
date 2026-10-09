@@ -43,7 +43,6 @@ from .dali510 import (
     group_dapc_addr,
     rgb_brightness_to_arcs,
     short_cmd_addr,
-    short_dapc_addr,
 )
 from .devices import (
     BROADCAST_UNIQUE_ID,
@@ -196,11 +195,13 @@ class _HelvarBase(CoordinatorEntity[Helvar510Coordinator], LightEntity):
     def __init__(self, coordinator: Helvar510Coordinator, device_info: DeviceInfo) -> None:
         super().__init__(coordinator)
         self._attr_device_info = device_info
-        # (arc levels as commanded, HA brightness that was asked for). While
-        # the bus still shows exactly these levels, report exactly that
-        # brightness: HA -> DALI -> HA is not 1:1 (log curve, 254 vs 255
-        # steps), and brightness_step must start from what was set.
-        self._commanded: tuple[tuple[int | None, ...], int] | None = None
+        # (arc levels as commanded, command seq per address, HA brightness
+        # that was asked for). While the bus still shows the result of that
+        # command, report exactly that brightness: HA -> DALI -> HA is not
+        # 1:1 (log curve, 254 vs 255 steps), and brightness_step must start
+        # from what was set - also when single gear of a group / DALI All
+        # ended up elsewhere (clamped, lost frame, gear that does not follow).
+        self._commanded: tuple[tuple[int | None, ...], tuple[int, ...], int] | None = None
 
     @property
     def available(self) -> bool:
@@ -211,21 +212,66 @@ class _HelvarBase(CoordinatorEntity[Helvar510Coordinator], LightEntity):
         coord = self.coordinator
         sas = self._brightness_sas()
         if brightness is not None and brightness > 0:
-            expected = {**{sa: (coord.data or {}).get(sa) for sa in sas},
-                        **coord.clamp_levels(levels)}
-            self._commanded = (tuple(expected.get(sa) for sa in sas), int(brightness))
+            data = coord.data or {}
+            clamped = coord.clamp_levels(levels)
+            # commit_levels bumps the command seq of every address it gets
+            self._commanded = (
+                tuple(clamped[sa] if sa in clamped else data.get(sa) for sa in sas),
+                tuple(coord.command_seq(sa) + (1 if sa in clamped else 0) for sa in sas),
+                int(brightness),
+            )
         else:
             self._commanded = None
         coord.commit_levels(levels)
 
+    async def _write(self, levels: dict[int, int], brightness: int | None) -> None:
+        """Per-address write through the coordinator's serialised queue.
+
+        Every write is verified later (readback after the fade, rewrite of
+        levels the gear did not take).
+        """
+        await self.coordinator.async_write_levels(levels)
+        self._remember_command(levels, brightness)
+
+    def _remember_command(self, levels: dict[int, int | None], brightness: int | None) -> None:
+        """Remember what was set (after the levels were committed)."""
+        coord = self.coordinator
+        if brightness is None or brightness <= 0:
+            self._commanded = None
+            return
+        data = coord.data or {}
+        sas = self._brightness_sas()
+        clamped = coord.clamp_levels(levels)
+        self._commanded = (
+            tuple(clamped[sa] if sa in clamped else data.get(sa) for sa in sas),
+            tuple(coord.command_seq(sa) for sa in sas),
+            int(brightness),
+        )
+
     def _commanded_brightness(self) -> int | None:
+        """The brightness that was set, unless the bus changed since.
+
+        Per address the current level must be the commanded one, the level
+        the gear settled at in answer to that command, or unknown (silent
+        gear). Anything else is a change made elsewhere (wall panel, other
+        controller, another entity) -> None, report from the bus.
+        """
         if self._commanded is None:
             return None
-        data = self.coordinator.data or {}
-        levels, bri = self._commanded
-        if tuple(data.get(sa) for sa in self._brightness_sas()) == levels:
-            return bri
-        return None
+        coord = self.coordinator
+        data = coord.data or {}
+        levels, seqs, bri = self._commanded
+        sas = self._brightness_sas()
+        if len(sas) != len(levels):
+            return None
+        for sa, want, seq in zip(sas, levels, seqs):
+            cur = data.get(sa)
+            if cur is None or cur == want:
+                continue
+            if coord.command_seq(sa) == seq and coord.settled_level(sa, seq) == cur:
+                continue
+            return None
+        return bri
 
     def _brightness_sas(self) -> list[int]:
         raise NotImplementedError
@@ -292,11 +338,9 @@ class DaliShortLight(_HelvarBase):
             bri = int(kwargs[ATTR_BRIGHTNESS])
             arc = brightness_to_arc(bri)
             if arc <= 0:
-                await self.coordinator.async_command(short_cmd_addr(self.sa), CMD_OFF)
-                self._commit({self.sa: 0}, None)
+                await self._write({self.sa: 0}, None)
             else:
-                await self.coordinator.async_dapc(short_dapc_addr(self.sa), arc)
-                self._commit({self.sa: arc}, bri)
+                await self._write({self.sa: arc}, bri)
         else:
             await self.coordinator.async_command(
                 short_cmd_addr(self.sa), CMD_RECALL_MAX
@@ -305,8 +349,7 @@ class DaliShortLight(_HelvarBase):
         self.coordinator.schedule_refresh([self.sa])
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.async_command(short_cmd_addr(self.sa), CMD_OFF)
-        self._commit({self.sa: 0}, None)
+        await self._write({self.sa: 0}, None)
         self.coordinator.schedule_refresh([self.sa])
 
 
@@ -439,6 +482,15 @@ class DaliStripLight(_HelvarBase, RestoreEntity):
         colour, bri = arcs_to_colour(levels)
         if bri <= 0:
             return
+        coord = self.coordinator
+        if any(
+            coord.settled_level(sa, coord.command_seq(sa)) is not None
+            for sa in self._brightness_sas()
+        ):
+            # a channel did not take what we sent (verified, rewrites
+            # exhausted): that is not a colour picked elsewhere -> keep ours
+            self._mem["brightness"] = bri
+            return
         if self._mem.get("arcs") == list(levels):
             # exactly what we commanded ourselves -> colour already known
             self._mem["brightness"] = bri
@@ -520,19 +572,12 @@ class DaliStripLight(_HelvarBase, RestoreEntity):
             return
         reported = max(1, min(255, int(round(bri))))
         self._remember(tuple(int(round(c)) for c in colour_f), reported)
-        items = [
-            (short_dapc_addr(self.channels[role]), arcs[i])
-            for i, role in enumerate(self._roles)
-        ]
-        await self.coordinator.async_dapc_many(items)
         sent = {self.channels[role]: arcs[i] for i, role in enumerate(self._roles)}
-        self._commit(sent, reported)
+        await self._write(sent, reported)
         self.coordinator.schedule_refresh(self._sas)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        items = [(short_dapc_addr(sa), 0) for sa in self._sas]
-        await self.coordinator.async_dapc_many(items)
-        self._commit({sa: 0 for sa in self._sas}, None)
+        await self._write({sa: 0 for sa in self._sas}, None)
         self.coordinator.schedule_refresh(self._sas)
 
 
@@ -596,12 +641,22 @@ class _MultiLight(_HelvarBase):
             ),
             default=0.0,
         ) or self._last_brightness or 255
-        plan = self.coordinator.plan_levels(members, target_bri, cur_bri)
-        items = [(short_dapc_addr(sa), plan[sa]) for sa in members]
-        chunk = 8  # avoid one huge transaction blocking too long
-        for i in range(0, len(items), chunk):
-            await self.coordinator.async_dapc_many(items[i : i + chunk])
-        self._commit(plan, target_bri)
+        coord = self.coordinator
+        plan = coord.plan_levels(members, target_bri, cur_bri)
+        rest = dict(plan)
+        for gnum, gmembers in self._group_frames(plan):
+            # one group DAPC instead of one frame per member
+            await coord.async_dapc(group_dapc_addr(gnum), plan[gmembers[0]])
+            coord.commit_levels({sa: plan[sa] for sa in gmembers}, notify=False)
+            for sa in gmembers:
+                rest.pop(sa, None)
+        await coord.async_write_levels(rest)
+        self._remember_command(plan, target_bri)
+        coord.async_update_listeners()
+
+    def _group_frames(self, plan: dict[int, int]) -> list[tuple[int, list[int]]]:
+        """DALI groups that can take one group DAPC for this plan."""
+        return []
 
 
 class DaliGroupLight(_MultiLight):
@@ -668,6 +723,27 @@ class DaliBroadcastLight(_MultiLight):
 
     def _members(self) -> list[int]:
         return list(self.coordinator.gear_by_sa)
+
+    def _group_frames(self, plan: dict[int, int]) -> list[tuple[int, list[int]]]:
+        """For DALI All: groups without strip channels whose members all get
+        the same level take one group DAPC (fewer frames per step on the
+        slow bus). Only used for the broadcast light, which addresses every
+        gear on the bus anyway."""
+        out: list[tuple[int, list[int]]] = []
+        used: set[int] = set()
+        groups = sorted(self.coordinator.groups.items(), key=lambda kv: -len(kv[1]))
+        for gnum, gmembers in groups:
+            if len(gmembers) < 2 or set(gmembers) & (self.strip_channels | used):
+                continue
+            if any(sa not in plan for sa in gmembers):
+                continue
+            if len({plan[sa] for sa in gmembers}) != 1:
+                continue
+            # every gear in this group must be fully covered by it: a gear in
+            # two groups would get the frame twice - harmless (same level)
+            out.append((gnum, list(gmembers)))
+            used.update(gmembers)
+        return out
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         # Broadcast DAPC would wreck strip colours - with strips, address
