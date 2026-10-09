@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # requirements_test.txt is a hashed lock file compiled by `uv pip compile`
+  # from requirements_test.in; the uv ecosystem regenerates it with hashes.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      test-dependencies:
+        patterns:
+          - "*"
