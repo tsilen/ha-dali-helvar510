@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import functools
 import logging
+import time
 from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
@@ -29,6 +30,18 @@ POLL_STAGGER_S = 0.05
 BUS_CALL_TIMEOUT_S = 30.0
 SCAN_TIMEOUT_S = 600.0
 FAIL_LIMIT = 3
+# Delay before a commanded address is read back. Every new command to the
+# same address postpones it (a held dimmer button sends a step about every
+# second), but never beyond REFRESH_MAX_DEFER_S after the first request.
+REFRESH_DELAY_S = 1.5
+REFRESH_MAX_DEFER_S = 6.0
+# A commanded level stays authoritative while the gear reports a running
+# fade (QUERY STATUS bit 4), at most this long (DALI fade time max 90.5 s).
+PENDING_MAX_S = 95.0
+FADE_RECHECK_S = 2.0
+STATUS_FADE_RUNNING = 0x10
+CMD_QUERY_STATUS = 0x90
+CMD_QUERY_ACTUAL_LEVEL = 0xA0
 
 
 class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
@@ -88,6 +101,14 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         self._lock = asyncio.Lock()
         self.data = {g["sa"]: g.get("actual") for g in self.gears}
         self._refresh_handles: list[asyncio.TimerHandle] = []
+        self._refresh_sas: set[int] = set()
+        self._refresh_first: float | None = None
+        # Commanded level per short address that the bus has not confirmed
+        # yet: sa -> (level, time.monotonic() of the command)
+        self._pending: dict[int, tuple[int, float]] = {}
+        # Bumped on every command per short address; a readback whose query
+        # started before a newer command is stale and dropped.
+        self._cmd_seq: dict[int, int] = {}
 
     # ------------------------------------------------------------ helpers
     @property
@@ -211,7 +232,8 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
     async def async_shutdown(self) -> None:
         for h in self._refresh_handles:
             h.cancel()
-        self._refresh_handles.clear()
+        self._refresh_handles = []
+        self._refresh_sas.clear()
         try:
             await super().async_shutdown()
         except AttributeError:
@@ -232,68 +254,157 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         except Dali510Error as err:
             raise UpdateFailed(f"510 not available: {err}") from err
 
-        data = dict(self.data or {})
+        updates: dict[int, int | None] = {}
+        fading: list[int] = []
         errors = 0
         for gear in self.gears:
             sa = gear["sa"]
             try:
-                level = await self._run(self.bus.query_short, sa, 0xA0)
+                result, level = await self._read_actual(sa)
             except Dali510Error as err:
                 errors += 1
                 _LOGGER.debug("poll sa %s failed: %s", sa, err)
                 if not self.bus.is_open:
                     raise UpdateFailed(f"510 I/O error: {err}") from err
                 continue
-            if level is None:
+            if result == "silent":
                 self.fail_count[sa] = self.fail_count.get(sa, 0) + 1
                 if self.fail_count[sa] >= FAIL_LIMIT:
-                    data[sa] = None
+                    updates[sa] = None
             else:
                 self.fail_count[sa] = 0
-                if level != 0xFF:  # MASK = fading/unknown -> keep previous
-                    data[sa] = level
+                if result == "ok":
+                    updates[sa] = level
+                elif result == "fading":
+                    fading.append(sa)
             await asyncio.sleep(POLL_STAGGER_S)
         if self.gears and errors == len(self.gears):
             raise UpdateFailed("no gear answered")
-        return data
+        if fading:
+            self.schedule_refresh(fading, FADE_RECHECK_S)
+        # Merge into the *current* data: commands sent while this poll was
+        # running must not be overwritten by the snapshot taken at its start.
+        return {**(self.data or {}), **updates}
+
+    async def _read_actual(self, sa: int) -> tuple[str, int | None]:
+        """QUERY ACTUAL LEVEL of one address, guarded against stale values.
+
+        Returns (result, level):
+          "ok"     -> level is the real level, use it,
+          "silent" -> no answer,
+          "keep"   -> MASK answer (unknown), keep the previous value,
+          "fading" -> differs from what we commanded and the gear says a
+                      fade is running: keep the commanded target, re-check,
+          "stale"  -> a newer command was sent while querying: drop it.
+        Only queries (0xA0 / 0x90) are sent.
+        """
+        seq = self._cmd_seq.get(sa, 0)
+        level = await self._run(self.bus.query_short, sa, CMD_QUERY_ACTUAL_LEVEL)
+        if level is None:
+            return "silent", None
+        if level == 0xFF:  # MASK = unknown -> keep previous
+            return "keep", None
+        pending = self._pending.get(sa)
+        if pending is not None and level != pending[0]:
+            if time.monotonic() - pending[1] < PENDING_MAX_S:
+                status = await self._run(self.bus.query_short, sa, CMD_QUERY_STATUS)
+                if status is None or status & STATUS_FADE_RUNNING:
+                    return ("stale" if self._cmd_seq.get(sa, 0) != seq else "fading"), None
+        if self._cmd_seq.get(sa, 0) != seq:
+            return "stale", None
+        if self._pending.get(sa) is pending:
+            # confirmed, clamped by the gear, or changed by someone else
+            self._pending.pop(sa, None)
+        return "ok", level
 
     def is_available(self, sa: int) -> bool:
         return self.fail_count.get(sa, 0) < FAIL_LIMIT
 
     async def async_refresh_addresses(self, sas: list[int]) -> None:
-        data = dict(self.data or {})
+        updates: dict[int, int | None] = {}
+        fading: list[int] = []
         for sa in sas:
             try:
-                level = await self._run(self.bus.query_short, sa, 0xA0)
+                result, level = await self._read_actual(sa)
             except Dali510Error as err:
                 _LOGGER.debug("refresh sa %s failed: %s", sa, err)
                 continue
-            if level is not None and level != 0xFF:
-                data[sa] = level
+            if result == "ok":
+                updates[sa] = level
                 self.fail_count[sa] = 0
+            elif result == "fading":
+                fading.append(sa)
             await asyncio.sleep(POLL_STAGGER_S)
-        self.async_set_updated_data(data)
+        if fading:
+            self.schedule_refresh(fading, FADE_RECHECK_S)
+        # merge into the current data (never write back an old snapshot)
+        if updates:
+            self.async_set_updated_data({**(self.data or {}), **updates})
 
     @callback
-    def schedule_refresh(self, sas: list[int], delay: float = 1.5) -> None:
-        def _go() -> None:
-            self.hass.async_create_task(self.async_refresh_addresses(list(sas)))
+    def schedule_refresh(self, sas: list[int], delay: float = REFRESH_DELAY_S) -> None:
+        """Read the given addresses back after `delay` seconds.
 
-        self._refresh_handles = [h for h in self._refresh_handles if not h.cancelled()]
-        self._refresh_handles.append(self.hass.loop.call_later(delay, _go))
+        Requests are coalesced: a new request postpones the pending one (so a
+        held dimmer button does not cause a readback between every step),
+        but at most REFRESH_MAX_DEFER_S after the first request.
+        """
+        now = time.monotonic()
+        if self._refresh_first is None:
+            self._refresh_first = now
+        self._refresh_sas.update(sas)
+        delay = max(0.0, min(delay, self._refresh_first + REFRESH_MAX_DEFER_S - now))
+        for h in self._refresh_handles:
+            h.cancel()
+
+        def _go() -> None:
+            todo = sorted(self._refresh_sas)
+            self._refresh_sas.clear()
+            self._refresh_first = None
+            self._refresh_handles = []
+            if todo:
+                self.hass.async_create_task(self.async_refresh_addresses(todo))
+
+        self._refresh_handles = [self.hass.loop.call_later(delay, _go)]
+
+    def clamp_levels(self, levels: dict[int, int | None]) -> dict[int, int | None]:
+        """Levels as the gear will really take them (min/max level clamp)."""
+        out: dict[int, int | None] = {}
+        for sa, lvl in levels.items():
+            if lvl is not None and lvl > 0:
+                gear = self.gear_by_sa.get(sa, {})
+                lo = gear.get("min_level") or 1
+                hi = gear.get("max_level") or 254
+                lvl = max(lo, min(hi, min(254, lvl)))
+            elif lvl is not None:
+                lvl = 0
+            out[sa] = lvl
+        return out
+
+    @callback
+    def commit_levels(self, levels: dict[int, int | None]) -> dict[int, int | None]:
+        """Record levels just written to the bus and show them immediately.
+
+        The commanded level stays authoritative until the bus confirms it (or
+        the gear finished fading to something else), so a following
+        brightness_step is computed from the target and not from a stale or
+        mid-fade readback.
+        """
+        clamped = self.clamp_levels(levels)
+        now = time.monotonic()
+        for sa, lvl in clamped.items():
+            self._cmd_seq[sa] = self._cmd_seq.get(sa, 0) + 1
+            if lvl is None:
+                self._pending.pop(sa, None)
+            else:
+                self._pending[sa] = (lvl, now)
+        self.note_commanded({sa: v for sa, v in clamped.items() if v is not None})
+        self.async_set_updated_data({**(self.data or {}), **clamped})
+        return clamped
 
     @callback
     def set_optimistic(self, sas: list[int], level: int | None) -> None:
-        data = dict(self.data or {})
-        for sa in sas:
-            gear = self.gear_by_sa.get(sa, {})
-            lvl = level
-            if lvl is not None and lvl > 0:
-                lo = gear.get("min_level") or 1
-                hi = gear.get("max_level") or 254
-                lvl = max(lo, min(hi, lvl))
-            data[sa] = lvl
-        self.async_set_updated_data(data)
+        self.commit_levels({sa: level for sa in sas})
 
     # ------------------------------------------------------------ commands
     async def async_dapc(self, addr_byte: int, level: int) -> Reply:

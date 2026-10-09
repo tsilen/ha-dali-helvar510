@@ -35,6 +35,7 @@ from .dali510 import (
     BROADCAST_CMD,
     BROADCAST_DAPC,
     arc_to_brightness,
+    arc_to_percent,
     arcs_to_colour,
     brightness_to_arc,
     default_strip_colour,
@@ -195,10 +196,39 @@ class _HelvarBase(CoordinatorEntity[Helvar510Coordinator], LightEntity):
     def __init__(self, coordinator: Helvar510Coordinator, device_info: DeviceInfo) -> None:
         super().__init__(coordinator)
         self._attr_device_info = device_info
+        # (arc levels as commanded, HA brightness that was asked for). While
+        # the bus still shows exactly these levels, report exactly that
+        # brightness: HA -> DALI -> HA is not 1:1 (log curve, 254 vs 255
+        # steps), and brightness_step must start from what was set.
+        self._commanded: tuple[tuple[int | None, ...], int] | None = None
 
     @property
     def available(self) -> bool:
         return self.coordinator.bus.is_open or super().available
+
+    def _commit(self, levels: dict[int, int | None], brightness: int | None) -> None:
+        """Show levels just written, remembering the requested brightness."""
+        coord = self.coordinator
+        sas = self._brightness_sas()
+        if brightness is not None and brightness > 0:
+            expected = {**{sa: (coord.data or {}).get(sa) for sa in sas},
+                        **coord.clamp_levels(levels)}
+            self._commanded = (tuple(expected.get(sa) for sa in sas), int(brightness))
+        else:
+            self._commanded = None
+        coord.commit_levels(levels)
+
+    def _commanded_brightness(self) -> int | None:
+        if self._commanded is None:
+            return None
+        data = self.coordinator.data or {}
+        levels, bri = self._commanded
+        if tuple(data.get(sa) for sa in self._brightness_sas()) == levels:
+            return bri
+        return None
+
+    def _brightness_sas(self) -> list[int]:
+        raise NotImplementedError
 
 
 class DaliShortLight(_HelvarBase):
@@ -245,34 +275,38 @@ class DaliShortLight(_HelvarBase):
             return None
         return level > 0
 
+    def _brightness_sas(self) -> list[int]:
+        return [self.sa]
+
     @property
     def brightness(self) -> int | None:
         level = (self.coordinator.data or {}).get(self.sa)
         if level is None:
             return None
+        if level > 0 and (bri := self._commanded_brightness()) is not None:
+            return bri
         return arc_to_brightness(level)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if ATTR_BRIGHTNESS in kwargs:
-            arc = brightness_to_arc(int(kwargs[ATTR_BRIGHTNESS]))
+            bri = int(kwargs[ATTR_BRIGHTNESS])
+            arc = brightness_to_arc(bri)
             if arc <= 0:
                 await self.coordinator.async_command(short_cmd_addr(self.sa), CMD_OFF)
-                self.coordinator.set_optimistic([self.sa], 0)
+                self._commit({self.sa: 0}, None)
             else:
                 await self.coordinator.async_dapc(short_dapc_addr(self.sa), arc)
-                self.coordinator.set_optimistic([self.sa], arc)
+                self._commit({self.sa: arc}, bri)
         else:
             await self.coordinator.async_command(
                 short_cmd_addr(self.sa), CMD_RECALL_MAX
             )
-            self.coordinator.set_optimistic(
-                [self.sa], self.gear.get("max_level") or 254
-            )
+            self._commit({self.sa: self.gear.get("max_level") or 254}, None)
         self.coordinator.schedule_refresh([self.sa])
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self.coordinator.async_command(short_cmd_addr(self.sa), CMD_OFF)
-        self.coordinator.set_optimistic([self.sa], 0)
+        self._commit({self.sa: 0}, None)
         self.coordinator.schedule_refresh([self.sa])
 
 
@@ -342,13 +376,25 @@ class DaliStripLight(_HelvarBase, RestoreEntity):
 
     # ---------------------------------------------------------- memory
     def _valid(self, colour: Any) -> tuple[int, ...] | None:
+        """Clean colour, normalised so its brightest component is 255.
+
+        Brightness lives only in `brightness`; a colour like (0, 0, 0, 128)
+        would otherwise scale the output a second time and the reported
+        brightness (brightest channel on the bus) would not match the one
+        that was set - every brightness_step up would end up darker.
+        """
         if not colour or len(colour) != len(self._roles):
             return None
         try:
             col = tuple(max(0, min(255, int(c))) for c in colour)
         except (TypeError, ValueError):
             return None
-        return col if any(col) else None
+        top = max(col)
+        if top <= 0:
+            return None
+        if top < 255:
+            col = tuple(int(round(c * 255.0 / top)) for c in col)
+        return col
 
     def _mem_colour(self) -> tuple[int, ...]:
         return self._valid(self._mem.get("colour")) or default_strip_colour(self.mode)
@@ -414,9 +460,14 @@ class DaliStripLight(_HelvarBase, RestoreEntity):
             return None
         return any((v or 0) > 0 for v in lv)
 
+    def _brightness_sas(self) -> list[int]:
+        return [self.channels[k] for k in self._roles]
+
     @property
     def brightness(self) -> int | None:
         _colour, bri = arcs_to_colour(self._levels())
+        if bri > 0 and (cmd := self._commanded_brightness()) is not None:
+            return cmd
         return bri
 
     def _current_colour(self) -> tuple[int, ...]:
@@ -445,36 +496,43 @@ class DaliStripLight(_HelvarBase, RestoreEntity):
 
     # ---------------------------------------------------------- commands
     async def async_turn_on(self, **kwargs: Any) -> None:
-        bri = int(kwargs.get(ATTR_BRIGHTNESS, self._mem.get("brightness") or 255))
-        if self.mode == "rgbw":
-            colour = tuple(kwargs.get(ATTR_RGBW_COLOR) or self._mem_colour())
-            arcs = rgb_brightness_to_arcs(colour[:3], bri, white=colour[3])
+        bri: float = int(kwargs.get(ATTR_BRIGHTNESS, self._mem.get("brightness") or 255))
+        key = ATTR_RGBW_COLOR if self.mode == "rgbw" else ATTR_RGB_COLOR
+        n = 4 if self.mode == "rgbw" else 3
+        given = kwargs.get(key)
+        if given is not None:
+            raw = [max(0.0, min(255.0, float(c))) for c in tuple(given)[:n]]
+            top = max(raw) if raw else 0.0
+            if top <= 0:
+                await self.async_turn_off()
+                return
+            # A colour that is not at full value (e.g. W only at 128) dims
+            # the output: keep that output, but report it as brightness with
+            # the colour normalised, so state == what is lit.
+            colour_f = [c * 255.0 / top for c in raw]
+            bri = bri * top / 255.0
         else:
-            colour = tuple(kwargs.get(ATTR_RGB_COLOR) or self._mem_colour()[:3])
-            arcs = rgb_brightness_to_arcs(colour[:3], bri)
+            colour_f = [float(c) for c in self._mem_colour()[:n]]
+        white = colour_f[3] if n == 4 else None
+        arcs = rgb_brightness_to_arcs(tuple(colour_f[:3]), bri, white=white)
         if not any(arcs):
             await self.async_turn_off()
             return
-        self._remember(colour, bri)
+        reported = max(1, min(255, int(round(bri))))
+        self._remember(tuple(int(round(c)) for c in colour_f), reported)
         items = [
             (short_dapc_addr(self.channels[role]), arcs[i])
             for i, role in enumerate(self._roles)
         ]
         await self.coordinator.async_dapc_many(items)
         sent = {self.channels[role]: arcs[i] for i, role in enumerate(self._roles)}
-        self.coordinator.note_commanded(sent)
-        data = dict(self.coordinator.data or {})
-        data.update(sent)
-        self.coordinator.async_set_updated_data(data)
+        self._commit(sent, reported)
         self.coordinator.schedule_refresh(self._sas)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         items = [(short_dapc_addr(sa), 0) for sa in self._sas]
         await self.coordinator.async_dapc_many(items)
-        data = dict(self.coordinator.data or {})
-        for sa in self._sas:
-            data[sa] = 0
-        self.coordinator.async_set_updated_data(data)
+        self._commit({sa: 0 for sa in self._sas}, None)
         self.coordinator.schedule_refresh(self._sas)
 
 
@@ -498,6 +556,9 @@ class _MultiLight(_HelvarBase):
     def _members(self) -> list[int]:
         return self.members
 
+    def _brightness_sas(self) -> list[int]:
+        return self._members()
+
     @property
     def is_on(self) -> bool | None:
         lv = self._member_levels()
@@ -512,6 +573,8 @@ class _MultiLight(_HelvarBase):
             return None
         # Represent brightness as max member (common UX)
         bri = arc_to_brightness(max(lv))
+        if bri and (cmd := self._commanded_brightness()) is not None:
+            bri = cmd
         if bri:
             self._last_brightness = bri
         return bri
@@ -523,18 +586,22 @@ class _MultiLight(_HelvarBase):
         """Per-address DAPC: on strips keep colour, off strips get last colour."""
         data = self.coordinator.data or {}
         members = self._members()
+        # Current brightness of the brightest member, unrounded (0-255 float),
+        # so strips are scaled by exactly target/current.
         cur_bri = max(
-            (arc_to_brightness(data.get(sa) or 0) or 0 for sa in members), default=0
+            (
+                arc_to_percent(lv) * 255.0 / 100.0
+                for lv in (data.get(sa) or 0 for sa in members)
+                if 0 < lv != 0xFF
+            ),
+            default=0.0,
         ) or self._last_brightness or 255
         plan = self.coordinator.plan_levels(members, target_bri, cur_bri)
         items = [(short_dapc_addr(sa), plan[sa]) for sa in members]
         chunk = 8  # avoid one huge transaction blocking too long
         for i in range(0, len(items), chunk):
             await self.coordinator.async_dapc_many(items[i : i + chunk])
-        self.coordinator.note_commanded(plan)
-        merged = dict(self.coordinator.data or {})
-        merged.update(plan)
-        self.coordinator.async_set_updated_data(merged)
+        self._commit(plan, target_bri)
 
 
 class DaliGroupLight(_MultiLight):
@@ -573,16 +640,16 @@ class DaliGroupLight(_MultiLight):
         elif ATTR_BRIGHTNESS in kwargs:
             arc = brightness_to_arc(bri)
             await self.coordinator.async_dapc(group_dapc_addr(self.dali_group), arc)
-            self.coordinator.set_optimistic(self.members, arc)
+            self._commit({sa: arc for sa in self.members}, bri)
         else:
             await self.coordinator.async_command(group_cmd_addr(self.dali_group), CMD_RECALL_MAX)
-            self.coordinator.set_optimistic(self.members, 254)
+            self._commit({sa: 254 for sa in self.members}, None)
         self.coordinator.schedule_refresh(self.members)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         # Group OFF is colour-safe (all channels to 0)
         await self.coordinator.async_command(group_cmd_addr(self.dali_group), CMD_OFF)
-        self.coordinator.set_optimistic(self.members, 0)
+        self._commit({sa: 0 for sa in self.members}, None)
         self.coordinator.schedule_refresh(self.members)
 
 
@@ -619,13 +686,13 @@ class DaliBroadcastLight(_MultiLight):
         elif ATTR_BRIGHTNESS in kwargs:
             arc = brightness_to_arc(bri)
             await self.coordinator.async_dapc(BROADCAST_DAPC, arc)
-            self.coordinator.set_optimistic(everyone, arc)
+            self._commit({sa: arc for sa in everyone}, bri)
         else:
             await self.coordinator.async_command(BROADCAST_CMD, CMD_RECALL_MAX)
-            self.coordinator.set_optimistic(everyone, 254)
+            self._commit({sa: 254 for sa in everyone}, None)
         self.coordinator.schedule_refresh(everyone)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self.coordinator.async_command(BROADCAST_CMD, CMD_OFF)
-        self.coordinator.set_optimistic(self._members(), 0)
+        self._commit({sa: 0 for sa in self._members()}, None)
         self.coordinator.schedule_refresh(self._members())
