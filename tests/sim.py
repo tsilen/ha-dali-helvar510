@@ -71,6 +71,7 @@ class SimBus:
         self.ignore_group_frames = False      # gear do not act on group frames
         self.query_delay_s = 0.0
         self.arc_frames = 0                   # DAPC / arc commands seen
+        self.arc_log: list[tuple[int, int]] = []  # (addr, data) of those
         self.queries = 0                      # frames expecting a reply
         self.groups = {sa: sum(1 << g for g in v["groups"]) for sa, v in self.gear.items()}
         self.twice_bit_works = True
@@ -130,6 +131,7 @@ class SimBus:
             self.violations.append(f"application extended command without ENABLE DT {live.hex()}")
         if not ctl & 0x04:  # no reply expected: DAPC / arc command
             self.arc_frames += 1
+            self.arc_log.append((addr, data))
             targets = [sa for sa in self._targets(addr) if not self._dropped(sa)]
             if self.ignore_group_frames and 0x80 <= addr < 0xA0:
                 targets = []
@@ -170,6 +172,10 @@ class SimBus:
         if data in table:
             return reply(table[data])
         return NO_REPLY
+
+    def frames_reaching(self, sa: int, since: int = 0) -> list[tuple[int, int]]:
+        """Arc frames (short, group or broadcast) that address `sa`."""
+        return [f for f in self.arc_log[since:] if sa in self._targets(f[0])]
 
     def _dropped(self, sa: int) -> bool:
         if self.drop.get(sa, 0) > 0:

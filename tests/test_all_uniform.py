@@ -226,8 +226,11 @@ async def test_cut_short_readback_does_not_revert_a_step(
     await _on(hass, allx, brightness=128)
     await task
     arc = brightness_to_arc(128)
-    assert all(coord.data[sa] == arc for sa in range(39) if sa not in {
-        s for st in STRIPS for s in st}), coord.data
+    strip_sas = {s for st in STRIPS for s in st}
+    assert all(
+        coord.data[sa] == coord.clamp_levels({sa: arc})[sa]
+        for sa in range(39) if sa not in strip_sas and sa not in coord.on_off
+    ), coord.data
     assert coord.stats.get("stale_dropped", 0) > 0
     assert _bri(hass, allx) == 128
     await _unload(hass, entry)

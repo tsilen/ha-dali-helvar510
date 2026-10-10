@@ -56,6 +56,13 @@ CONF_HIDE_GROUP_MEMBERS = "hide_group_members"
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_HIDE_STRIP_CHANNELS = True
 DEFAULT_HIDE_GROUP_MEMBERS = True
+# Per short address gear type override (options): {"38": "onoff"}; missing = auto
+CONF_GEAR_TYPES = "gear_types"
+GEAR_TYPE_AUTO = "auto"
+GEAR_TYPE_DIMMABLE = "dimmable"
+GEAR_TYPE_ONOFF = "onoff"
+GEAR_TYPES = (GEAR_TYPE_AUTO, GEAR_TYPE_DIMMABLE, GEAR_TYPE_ONOFF)
+DT_SWITCHING = 7
 
 # One strip: {"name": "...", "channels": {"r": sa, "g": sa, "b": sa, "w": sa|null}}
 CHANNEL_ROLES = ("r", "g", "b", "w")

@@ -118,7 +118,29 @@ remove and re-add the integration.
    later), or skip.
 
 **Configure** (options) later lets you change the poll interval and hiding
-options, add / edit / delete strips, and rescan the bus (queries only).
+options, add / edit / delete strips, set the gear type of a light, and
+rescan the bus (queries only).
+
+### On/off-only gear
+
+Relays, switching modules and DALI gear driving a non-dimmable load cannot
+dim. They are detected from the scan data (no extra bus traffic): device
+type 7 (switching function), or PHYSICAL MINIMUM LEVEL 254, or MIN LEVEL =
+MAX LEVEL = 254. **Configure → Gear type of a light** overrides this per
+light: *Auto* (default), *Dimmable* or *On/off only*. Entity, name, aliases
+and area stay when the type changes.
+
+- The light itself is an on/off light (no brightness): on = RECALL MAX,
+  off = OFF. Attributes `on_off_only` and `phys_min` show what was used.
+- In a group or DALI All it is switched, never dimmed, and it does not take
+  part in the group's brightness:
+  - a brightness change of a group / DALI All that is already on (also
+    `brightness_step_pct`) sends it nothing - it stays on or off as it is,
+  - turning the group / DALI All on from off (also with a brightness or a
+    step up from off) switches it on, as does `turn_on` without a
+    brightness,
+  - turning off, or stepping down to 0, switches it off.
+- Its readbacks are verified as on / off only (any level above 0 is "on").
 
 ## Services
 
@@ -203,6 +225,8 @@ python3 tools/dali510_test.py list        # hidraw devices, marks 16eb:0510
 python3 tools/dali510_test.py query 0     # QUERY ACTUAL LEVEL of short address 0
 python3 tools/dali510_test.py scan        # query-only scan + strip suggestions
 python3 tools/dali510_test.py groups 5    # QUERY GROUPS of short address 5
+python3 tools/dali510_test.py info 38     # status, version, device type(s), physical
+                                          # min, max/min, power-on, failure level, fade
 python3 tools/dali510_test.py dapc 0 200  # DAPC level 200 to short address 0
 python3 tools/dali510_test.py off         # broadcast OFF (asks for confirmation)
 python3 tools/dali510_test.py on          # broadcast RECALL MAX
@@ -251,6 +275,17 @@ The tests run the real driver against a simulated 510 and DALI bus with
 synthetic gear (`tests/sim.py`).
 
 ## Changelog
+
+### 0.3.4
+
+- **On/off-only gear** (relay, switching module, non-dimmable driver):
+  detected from the scan data (DT7, physical minimum 254, or min = max =
+  254), overridable per light in the options (Auto / Dimmable / On/off
+  only). Such a light is an on/off light; groups and DALI All switch it but
+  never dim it - a brightness change of a group that is already on leaves it
+  as it is. See [On/off-only gear](#onoff-only-gear).
+- `tools/dali510_test.py info SA`: standard queries of one address
+  (read-only); `scan` also prints device types, min / max / physical min.
 
 ### 0.3.3
 

@@ -119,12 +119,13 @@ def _build_entities(entry: ConfigEntry, coord: Helvar510Coordinator) -> list[Lig
         else:
             # Own device (name None -> "DALI 19") or, as a group member, on the
             # hub (name "5" -> "DALI 5").
-            ent = DaliShortLight(coord, gear, dev(key), name)
+            ent = DaliShortLight(coord, gear, dev(key), name, on_off=sa in coord.on_off)
         if sa_should_hide(sa, strips, gears, hide_strips, hide_groups):
             # Keep ENABLED; only hide from the UI by default.
             ent._attr_entity_registry_visible_default = False
         ent.layout_sig = (
             type(ent).__name__, key, name, tuple(gear.get("groups") or ()),
+            sa in coord.on_off,
         )
         entities.append(ent)
 
@@ -140,12 +141,17 @@ def _build_entities(entry: ConfigEntry, coord: Helvar510Coordinator) -> list[Lig
     # DALI groups that have members
     for gnum, members in coord.groups.items():
         ent = DaliGroupLight(coord, gnum, members, strip_channels, dev(group_key(entry, gnum)))
-        ent.layout_sig = ("group", tuple(members), tuple(sorted(strip_channels)))
+        ent.layout_sig = (
+            "group", tuple(members), tuple(sorted(strip_channels)),
+            tuple(sorted(coord.on_off & set(members))),
+        )
         entities.append(ent)
 
     # Broadcast (own device "DALI All", so its name and area stay as before)
     ent = DaliBroadcastLight(coord, strip_channels, dev(all_key(entry)))
-    ent.layout_sig = ("all", tuple(sorted(strip_channels)))
+    ent.layout_sig = (
+        "all", tuple(sorted(strip_channels)), tuple(sorted(coord.on_off)),
+    )
     entities.append(ent)
     return entities
 
@@ -291,11 +297,17 @@ class DaliShortLight(_HelvarBase):
         gear: dict,
         device_info: DeviceInfo,
         name: str | None = None,
+        on_off: bool = False,
     ) -> None:
         super().__init__(coordinator, device_info)
         self._attr_name = name
         self.sa = gear["sa"]
         self.gear = gear
+        self.on_off = on_off
+        if on_off:
+            # relay / switching module / non-dimmable driver: on and off only
+            self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
         self._attr_unique_id = sa_unique_id(self.sa)
         dt = gear.get("device_type")
         self._attr_extra_state_attributes = {
@@ -305,6 +317,8 @@ class DaliShortLight(_HelvarBase):
             "groups": gear.get("groups") or [],
             "min_level": gear.get("min_level"),
             "max_level": gear.get("max_level"),
+            "phys_min": gear.get("phys_min"),
+            "on_off_only": on_off,
             "random_address": (
                 f"{gear['random_address']:06X}"
                 if gear.get("random_address") is not None
@@ -328,6 +342,8 @@ class DaliShortLight(_HelvarBase):
 
     @property
     def brightness(self) -> int | None:
+        if self.on_off:
+            return None
         level = (self.coordinator.data or {}).get(self.sa)
         if level is None:
             return None
@@ -336,6 +352,11 @@ class DaliShortLight(_HelvarBase):
         return arc_to_brightness(level)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        if self.on_off:
+            await self.coordinator.async_switch_on([self.sa])
+            self._commanded = None
+            self.coordinator.schedule_refresh([self.sa])
+            return
         if ATTR_BRIGHTNESS in kwargs:
             bri = int(kwargs[ATTR_BRIGHTNESS])
             arc = brightness_to_arc(bri)
@@ -603,8 +624,29 @@ class _MultiLight(_HelvarBase):
     def _members(self) -> list[int]:
         return self.members
 
+    def _onoff_members(self) -> list[int]:
+        """On/off-only gear: switched on/off with the group, never dimmed."""
+        on_off = self.coordinator.on_off
+        return [sa for sa in self._members() if sa in on_off]
+
+    def _dim_members(self) -> list[int]:
+        on_off = self.coordinator.on_off
+        return [sa for sa in self._members() if sa not in on_off]
+
     def _brightness_sas(self) -> list[int]:
-        return self._members()
+        # on/off-only gear does not take part in the group's brightness
+        return self._dim_members()
+
+    def _setup_modes(self) -> None:
+        """A group of on/off-only gear only is an on/off light itself."""
+        if self._members() and not self._dim_members():
+            self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
+        if self._onoff_members():
+            self._attr_extra_state_attributes = {
+                **(getattr(self, "_attr_extra_state_attributes", None) or {}),
+                "on_off_members": self._onoff_members(),
+            }
 
     @property
     def is_on(self) -> bool | None:
@@ -615,12 +657,17 @@ class _MultiLight(_HelvarBase):
 
     @property
     def brightness(self) -> int | None:
-        lv = [v for v in self._member_levels() if v is not None]
+        if ColorMode.ONOFF in self._attr_supported_color_modes:
+            return None
+        data = self.coordinator.data or {}
+        lv = [data.get(sa) for sa in self._dim_members()]
+        lv = [v for v in lv if v is not None]
         if not lv:
             return None
         lit = [v for v in lv if v > 0]
         if not lit:
-            return 0
+            # only on/off-only members are on (or all off)
+            return None if self.is_on else 0
         # A group / DALI All sets every member to one brightness: report that
         # while most members are still where it put them. Otherwise report
         # the level most members are at - not the brightest member, so one
@@ -638,7 +685,7 @@ class _MultiLight(_HelvarBase):
         their colour, not their brightness, per channel)."""
         data = self.coordinator.data or {}
         plain = [
-            data.get(sa) for sa in self._members()
+            data.get(sa) for sa in self._dim_members()
             if sa not in self.strip_channels and (data.get(sa) or 0) > 0
         ]
         pool = plain or lit
@@ -677,6 +724,41 @@ class _MultiLight(_HelvarBase):
     def _has_strip_members(self) -> bool:
         return bool(set(self._members()) & self.strip_channels)
 
+    async def _async_turn_on_mixed(self, kwargs: dict[str, Any]) -> bool:
+        """turn_on for a group / All with on/off-only members.
+
+        * brightness change while the group is on (also brightness_step):
+          only dimmable members are set; on/off-only members are left as
+          they are and get no frame at all,
+        * off -> on, or turn_on without brightness: dimmable members to the
+          brightness, on/off-only members that are off get RECALL MAX,
+        * brightness 0 -> turn_off (everything off).
+        Returns False when there are no on/off-only members (caller's path).
+        """
+        onoff = self._onoff_members()
+        if not onoff:
+            return False
+        coord = self.coordinator
+        was_on = bool(self.is_on)
+        if ATTR_BRIGHTNESS in kwargs:
+            bri = int(kwargs[ATTR_BRIGHTNESS])
+            if brightness_to_arc(bri) <= 0:
+                await self.async_turn_off()
+                return True
+            self._last_brightness = bri
+        else:
+            bri = self._last_brightness or 255
+        data = coord.data or {}
+        if ATTR_BRIGHTNESS in kwargs and was_on:
+            switch: list[int] = []
+        else:
+            switch = [sa for sa in onoff if not (data.get(sa) or 0) > 0]
+        if self._dim_members():
+            await self._apply_plan(bri)
+        await coord.async_switch_on(switch)
+        coord.schedule_refresh(self._dim_members() + switch)
+        return True
+
     async def _apply_plan(self, target_bri: int) -> None:
         """Every member to `target_bri`, per short address (verified).
 
@@ -687,7 +769,7 @@ class _MultiLight(_HelvarBase):
         stayed behind while a dimmer button was held).
         """
         coord = self.coordinator
-        plan = coord.plan_levels(self._members(), target_bri)
+        plan = coord.plan_levels(self._dim_members(), target_bri)
         _LOGGER.debug(
             "%s: brightness %s -> %s per-address frames", self.entity_id, target_bri, len(plan)
         )
@@ -717,8 +799,11 @@ class DaliGroupLight(_MultiLight):
             "members": self.members,
             "contains_strip_channels": bool(set(self.members) & strip_channels),
         }
+        self._setup_modes()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        if await self._async_turn_on_mixed(kwargs):
+            return
         if ATTR_BRIGHTNESS in kwargs:
             bri = int(kwargs[ATTR_BRIGHTNESS])
             if brightness_to_arc(bri) <= 0:
@@ -757,11 +842,14 @@ class DaliBroadcastLight(_MultiLight):
         super().__init__(coordinator, device_info)
         self.strip_channels = strip_channels
         self._attr_unique_id = BROADCAST_UNIQUE_ID
+        self._setup_modes()
 
     def _members(self) -> list[int]:
         return list(self.coordinator.gear_by_sa)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        if await self._async_turn_on_mixed(kwargs):
+            return
         # Broadcast DAPC would wreck strip colours - with strips, address
         # every gear individually (same rule as groups with strip members).
         if ATTR_BRIGHTNESS in kwargs:

@@ -9,6 +9,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_GEAR_TYPES,
     CONF_HIDE_GROUP_MEMBERS,
     CONF_HIDE_STRIP_CHANNELS,
     CONF_NAME_PREFIX,
@@ -23,7 +24,10 @@ from .const import (
     DT_NAMES,
     ENTRY_MINOR_VERSION,
     ENTRY_VERSION,
+    GEAR_TYPE_AUTO,
+    GEAR_TYPES,
 )
+from .coordinator import detect_on_off
 from .devices import (
     async_apply_sa_visibility,
     visibility_state,
@@ -69,6 +73,13 @@ def _gear_label(g: dict) -> str:
     groups = g.get("groups") or []
     gtxt = f", G{','.join(map(str, groups))}" if groups else ""
     return f"SA {g['sa']} — {dt_name}{gtxt}"
+
+
+def _gear_type_label(g: dict, gear_types: dict) -> str:
+    mode = gear_types.get(str(g["sa"]), GEAR_TYPE_AUTO)
+    auto = "on/off only" if detect_on_off(g) else "dimmable"
+    lv = f", min {g.get('min_level')}/max {g.get('max_level')}" if g.get("min_level") else ""
+    return f"{_gear_label(g)}{lv} — {mode} (auto: {auto})"
 
 
 def _strip_schema(gears: list[dict], suggestion: list[int] | None = None) -> vol.Schema:
@@ -306,6 +317,8 @@ class Helvar510OptionsFlow(config_entries.OptionsFlow):
         self._hide_groups = DEFAULT_HIDE_GROUP_MEMBERS
         self._pending_action = ""
         self._edit_idx = 0
+        self._gear_types: dict[str, str] = {}
+        self._gear_sa = 0
 
     def _ensure_state(self) -> None:
         if self._gears:
@@ -324,6 +337,7 @@ class Helvar510OptionsFlow(config_entries.OptionsFlow):
         self._hide_groups = entry.options.get(
             CONF_HIDE_GROUP_MEMBERS, DEFAULT_HIDE_GROUP_MEMBERS
         )
+        self._gear_types = dict(entry.options.get(CONF_GEAR_TYPES) or {})
 
     async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
         self._ensure_state()
@@ -345,6 +359,8 @@ class Helvar510OptionsFlow(config_entries.OptionsFlow):
                 self._strips = []
             if action == "rescan":
                 return await self.async_step_rescan()
+            if action == "gear_type":
+                return await self.async_step_select_gear()
             return self._save()
 
         strip_txt = ", ".join(_strip_label(s) for s in self._strips) or "-"
@@ -361,7 +377,8 @@ class Helvar510OptionsFlow(config_entries.OptionsFlow):
                         selector.SelectSelectorConfig(
                             options=[
                                 "save", "add_strip", "edit_strip",
-                                "delete_strip", "clear_strips", "rescan",
+                                "delete_strip", "clear_strips", "gear_type",
+                                "rescan",
                             ],
                             mode="dropdown",
                             translation_key="options_action",
@@ -428,6 +445,73 @@ class Helvar510OptionsFlow(config_entries.OptionsFlow):
                 CONF_STRIPS: self._strips,
                 CONF_HIDE_STRIP_CHANNELS: self._hide,
                 CONF_HIDE_GROUP_MEMBERS: self._hide_groups,
+                CONF_GEAR_TYPES: {
+                    k: v for k, v in self._gear_types.items() if v != GEAR_TYPE_AUTO
+                },
+            },
+        )
+
+    def _typed_gears(self) -> list[dict]:
+        strip_sas = {c for s in self._strips for c in s["channels"].values()}
+        return [g for g in self._gears if g["sa"] not in strip_sas]
+
+    async def async_step_select_gear(self, user_input: dict | None = None) -> FlowResult:
+        """Gear type per light: pick the light (strip channels excluded)."""
+        self._ensure_state()
+        gears = self._typed_gears()
+        if not gears:
+            return await self.async_step_init()
+        if user_input is not None:
+            self._gear_sa = int(user_input["gear"])
+            return await self.async_step_gear_type()
+        return self.async_show_form(
+            step_id="select_gear",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("gear", default=str(gears[0]["sa"])): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                {"value": str(g["sa"]),
+                                 "label": _gear_type_label(g, self._gear_types)}
+                                for g in gears
+                            ],
+                            mode="dropdown",
+                        )
+                    )
+                }
+            ),
+        )
+
+    async def async_step_gear_type(self, user_input: dict | None = None) -> FlowResult:
+        """Auto (from scan data) / Dimmable / On/off only for one light.
+        Saved with the other options (entity, name, area stay)."""
+        key = str(self._gear_sa)
+        gear = next((g for g in self._gears if g["sa"] == self._gear_sa), {"sa": self._gear_sa})
+        if user_input is not None:
+            mode = user_input["gear_type"]
+            if mode == GEAR_TYPE_AUTO:
+                self._gear_types.pop(key, None)
+            else:
+                self._gear_types[key] = mode
+            return await self.async_step_init()
+        return self.async_show_form(
+            step_id="gear_type",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "gear_type", default=self._gear_types.get(key, GEAR_TYPE_AUTO)
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=list(GEAR_TYPES),
+                            mode="dropdown",
+                            translation_key="gear_type",
+                        )
+                    )
+                }
+            ),
+            description_placeholders={
+                "gear": _gear_label(gear),
+                "auto": "on/off only" if detect_on_off(gear) else "dimmable",
             },
         )
 
