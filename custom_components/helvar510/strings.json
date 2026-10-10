@@ -84,6 +84,19 @@
           "w": "White channel (RGBW only)",
           "skip": "Cancel"
         }
+      },
+      "select_gear": {
+        "title": "Gear type",
+        "data": {
+          "gear": "Light"
+        }
+      },
+      "gear_type": {
+        "title": "Gear type",
+        "description": "{gear}. Auto detects on/off-only gear from the scan data (DT7, physical minimum 254, or min = max = 254); here: {auto}. An on/off-only light has no brightness and is not dimmed by its groups or DALI All.",
+        "data": {
+          "gear_type": "Gear type"
+        }
       }
     },
     "error": {
@@ -105,7 +118,15 @@
         "edit_strip": "Edit strip",
         "delete_strip": "Delete strip",
         "clear_strips": "Delete all strips",
-        "rescan": "Rescan bus (queries only)"
+        "rescan": "Rescan bus (queries only)",
+        "gear_type": "Gear type of a light (dimmable / on/off only)"
+      }
+    },
+    "gear_type": {
+      "options": {
+        "auto": "Auto (from scan data)",
+        "dimmable": "Dimmable",
+        "onoff": "On/off only"
       }
     }
   },

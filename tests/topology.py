@@ -16,10 +16,12 @@ GROUPS = {
     3: [8, 30, 32],
     4: [19, 21],
 }
-# some gear with a raised MIN LEVEL (phase dimmers, some LED drivers)
-MIN_LEVEL = {12: 120, 13: 120, 19: 110, 20: 110, 21: 110, 22: 110, 38: 130,
+# MIN LEVEL = PHYSICAL MINIMUM as read from the real gear: DT4 phase dimmers
+# 170, single-channel DT6 85, 4-channel DT6 (strips) 1. Short 38 is a DT4
+# that cannot dim at all (physical min = min = max = 254): on/off only.
+MIN_LEVEL = {12: 170, 13: 170, 19: 170, 20: 170, 21: 170, 22: 170, 38: 254,
              5: 85, 6: 85, 29: 100}
-
+ON_OFF = {38}
 
 def topology_gear() -> dict[int, dict]:
     gear: dict[int, dict] = {}
@@ -33,6 +35,7 @@ def topology_gear() -> dict[int, dict]:
         g = {"dt": 4 if sa in DT4 else 6, "rand": rand, "groups": groups}
         if sa in MIN_LEVEL:
             g["min"] = MIN_LEVEL[sa]
+            g["phys_min"] = MIN_LEVEL[sa]
         gear[sa] = g
     return gear
 

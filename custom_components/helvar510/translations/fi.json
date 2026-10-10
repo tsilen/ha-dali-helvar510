@@ -84,6 +84,19 @@
           "w": "Valkoinen kanava (vain RGBW)",
           "skip": "Peruuta"
         }
+      },
+      "select_gear": {
+        "title": "Laitetyyppi",
+        "data": {
+          "gear": "Valaisin"
+        }
+      },
+      "gear_type": {
+        "title": "Laitetyyppi",
+        "description": "{gear}. Automaattinen tunnistaa vain päälle/pois-laitteet skannaustiedoista (DT7, fyysinen minimi 254 tai min = max = 254); tässä: {auto}. Päälle/pois-valaisimella ei ole kirkkautta, eikä sen ryhmä tai DALI All himmennä sitä.",
+        "data": {
+          "gear_type": "Laitetyyppi"
+        }
       }
     },
     "error": {
@@ -105,7 +118,15 @@
         "edit_strip": "Muokkaa nauhaa",
         "delete_strip": "Poista nauha",
         "clear_strips": "Poista kaikki nauhat",
-        "rescan": "Skannaa väylä uudelleen (vain kyselyt)"
+        "rescan": "Skannaa väylä uudelleen (vain kyselyt)",
+        "gear_type": "Valaisimen laitetyyppi (himmennettävä / päälle/pois)"
+      }
+    },
+    "gear_type": {
+      "options": {
+        "auto": "Automaattinen (skannaustiedoista)",
+        "dimmable": "Himmennettävä",
+        "onoff": "Vain päälle/pois"
       }
     }
   },

@@ -55,6 +55,44 @@ CMD_QUERY_STATUS = 0x90
 CMD_QUERY_ACTUAL_LEVEL = 0xA0
 
 
+
+def detect_on_off(gear: dict) -> bool:
+    """On/off-only gear, from scan data (queries only, no extra bus traffic).
+
+    * DT7 (switching function, IEC 62386-208) among the device types,
+    * PHYSICAL MINIMUM LEVEL 254 (the gear cannot dim at all),
+    * MIN LEVEL == MAX LEVEL == 254.
+    """
+    from .const import DT_SWITCHING
+
+    types = list(gear.get("device_types") or [])
+    if gear.get("device_type") is not None:
+        types.append(gear.get("device_type"))
+    if DT_SWITCHING in types:
+        return True
+    if gear.get("phys_min") == 254:
+        return True
+    return gear.get("min_level") == 254 and gear.get("max_level") == 254
+
+
+def on_off_sas(gears: list[dict], strips: list[dict], overrides: dict) -> set[int]:
+    """Short addresses handled as on/off only (auto-detect + options override).
+    Strip channels are always dimmable channels."""
+    from .const import GEAR_TYPE_DIMMABLE, GEAR_TYPE_ONOFF
+
+    in_strip = {sa for st in strips for sa in st["channels"].values()}
+    out: set[int] = set()
+    for g in gears:
+        sa = g["sa"]
+        if sa in in_strip:
+            continue
+        mode = (overrides or {}).get(str(sa))
+        if mode == GEAR_TYPE_ONOFF or (
+            mode != GEAR_TYPE_DIMMABLE and detect_on_off(g)
+        ):
+            out.add(sa)
+    return out
+
 class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
     """data = {short_address: arc level (0 = off) | None (unknown)}."""
 
@@ -107,6 +145,8 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
             strip_unique_id(s): {"colour": None, "brightness": None}
             for s in self.strips
         }
+        self.on_off: set[int] = set()
+        self._update_on_off()
         self.fail_count: dict[int, int] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="helvar510")
         self._lock = asyncio.Lock()
@@ -141,6 +181,20 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
                                       "queries": 0, "rewrites": 0, "skipped": 0}
 
     # ------------------------------------------------------------ helpers
+    def _update_on_off(self) -> None:
+        from .const import CONF_GEAR_TYPES
+
+        self.on_off = on_off_sas(
+            self.gears, self.strips, dict(self.entry.options.get(CONF_GEAR_TYPES) or {})
+        )
+
+    def is_on_off(self, sa: int) -> bool:
+        return sa in self.on_off
+
+    def on_level(self, sa: int) -> int:
+        """Level an on/off gear shows when on (its MAX LEVEL)."""
+        return (self.gear_by_sa.get(sa) or {}).get("max_level") or 254
+
     @property
     def groups(self) -> dict[int, list[int]]:
         out: dict[int, list[int]] = {}
@@ -344,6 +398,19 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         if level == 0xFF:  # MASK = unknown -> keep previous
             return "keep", None
         pending = self._pending.get(sa)
+        if (
+            pending is not None and sa in self.on_off
+            and (level > 0) == (pending[0] > 0)
+        ):
+            # on/off gear: on is on, whatever level it reports
+            if self._gen.get(sa, 0) != gen:
+                return "stale", None
+            if self._pending.get(sa) is pending:
+                self._pending.pop(sa, None)
+                self._retries.pop(sa, None)
+                if level != pending[0]:
+                    self._settled[sa] = (seq, level)
+            return "ok", level
         if pending is not None and level != pending[0]:
             if time.monotonic() - pending[1] < PENDING_MAX_S:
                 self.stats["queries"] += 1
@@ -505,7 +572,9 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         """Levels as the gear will really take them (min/max level clamp)."""
         out: dict[int, int | None] = {}
         for sa, lvl in levels.items():
-            if lvl is not None and lvl > 0:
+            if lvl is not None and lvl > 0 and sa in self.on_off:
+                lvl = self.on_level(sa)
+            elif lvl is not None and lvl > 0:
                 gear = self.gear_by_sa.get(sa, {})
                 lo = gear.get("min_level") or 1
                 hi = gear.get("max_level") or 254
@@ -567,6 +636,17 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         self.stats["group_frames"] += 1
         self._last_write = time.monotonic()
         return await self._run(self.bus.command, addr_byte, cmd)
+
+    async def async_switch_on(self, sas: list[int]) -> None:
+        """RECALL MAX to on/off-only gear, one short address at a time."""
+        from .const import CMD_RECALL_MAX
+        from .dali510 import short_cmd_addr
+
+        for sa in sas:
+            await self.async_command(short_cmd_addr(sa), CMD_RECALL_MAX)
+            self.commit_levels({sa: self.on_level(sa)}, notify=False)
+        if sas:
+            self.async_update_listeners()
 
     async def async_dapc_many(self, items: list[tuple[int, int]]) -> list[Reply]:
         await self._ensure_open()
@@ -681,6 +761,7 @@ class Helvar510Coordinator(DataUpdateCoordinator[dict[int, int | None]]):
         self.strips = list(entry.options.get(CONF_STRIPS, entry.data.get(CONF_STRIPS, [])))
         for st in self.strips:
             self.strip_mem.setdefault(strip_unique_id(st), {"colour": None, "brightness": None})
+        self._update_on_off()
         poll = entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
         self.update_interval = timedelta(seconds=max(5, int(poll)))
         data = dict(self.data or {})
